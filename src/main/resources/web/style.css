@@ -1,0 +1,37 @@
+/* The app's look (Theme.kt): black, deep purple panels, monospace. */
+:root { --ink:#000; --panel:#0A0510; --soft:#0D0716; --line:rgba(185,107,255,.18); --text:#DCD0EC; --text-soft:#A99CC4;
+  --faint:#6C5C86; --purple:#B96BFF; --orange:#F7931A; --good:#34D399; --warn:#FFC53D; --bad:#FF5D5D; }
+* { box-sizing:border-box; }
+html, body { margin:0; background:var(--ink); color:var(--text); font-family:ui-monospace,"SFMono-Regular",Menlo,Consolas,"Liberation Mono",monospace; font-size:13px; }
+main { max-width:520px; margin:0 auto; padding:16px 14px calc(40px + env(safe-area-inset-bottom)); }
+h1 { font-size:18px; color:var(--purple); margin:4px 0 10px; }
+.panel { background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:16px; margin:12px 0; }
+.panel.warn { border-color:rgba(255,197,61,.35); } .panel.bad { border-color:rgba(255,93,93,.4); }
+.label { font-size:10px; letter-spacing:1.5px; text-transform:uppercase; color:var(--purple); margin-bottom:8px; }
+.row { display:flex; align-items:center; gap:8px; } .row > .grow { flex:1; min-width:0; }
+.between { display:flex; justify-content:space-between; align-items:center; gap:8px; }
+.big { font-size:40px; font-weight:bold; color:var(--purple); word-break:break-all; }
+.mid { font-size:20px; color:var(--text); }
+.soft { color:var(--text-soft); } .faint { color:var(--faint); } .good { color:var(--good); } .warnc { color:var(--warn); } .badc { color:var(--bad); }
+.small { font-size:11px; } .center { text-align:center; } .mono { word-break:break-all; }
+button { font:inherit; cursor:pointer; border-radius:12px; border:none; padding:12px 14px; font-weight:bold; letter-spacing:.5px; }
+button.primary { background:var(--purple); color:#000; } button.soft { background:var(--soft); color:var(--purple); border:1px solid var(--line); }
+button.link { background:none; color:var(--purple); padding:6px 8px; font-weight:normal; } button.link.faint { color:var(--faint); }
+button:disabled { opacity:.4; cursor:default; }
+.btns { display:flex; gap:8px; margin-top:10px; } .btns > button { flex:1; }
+.tabs { display:flex; background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:4px; gap:4px; }
+.tabs button { flex:1; background:none; color:var(--faint); padding:10px 4px; } .tabs button.on { background:#24133a; color:var(--purple); }
+input, textarea, select { font:inherit; width:100%; background:#05020a; color:var(--text); border:1px solid var(--line); border-radius:10px; padding:11px 12px; margin:4px 0; }
+textarea { min-height:70px; resize:vertical; } input:focus, textarea:focus { outline:1px solid var(--purple); }
+label.check { display:flex; gap:10px; align-items:center; margin:8px 0; cursor:pointer; } label.check input { width:auto; margin:0; }
+.tx { padding:10px 0; border-bottom:1px solid var(--line); cursor:pointer; } .tx:last-child { border-bottom:none; }
+.in { color:var(--good); } .out { color:var(--text); }
+.qr { background:#fff; padding:10px; border-radius:12px; width:240px; margin:10px auto; } .qr img { width:100%; display:block; image-rendering:pixelated; }
+.words { display:grid; grid-template-columns:1fr 1fr; gap:6px; } .words div { background:#05020a; border:1px solid var(--line); border-radius:8px; padding:8px; }
+.toast { position:fixed; left:50%; bottom:24px; transform:translateX(-50%); background:#24133a; color:var(--text); border:1px solid var(--purple);
+  padding:10px 16px; border-radius:20px; max-width:90vw; z-index:10; } .hidden { display:none; }
+.modal-bg { position:fixed; inset:0; background:rgba(0,0,0,.75); display:flex; align-items:flex-end; justify-content:center; z-index:5; }
+.modal { background:var(--panel); border:1px solid var(--line); border-radius:18px 18px 0 0; padding:18px; width:100%; max-width:520px; max-height:88vh; overflow:auto; }
+.pill { display:inline-block; padding:2px 8px; border-radius:10px; background:var(--soft); color:var(--text-soft); font-size:10px; }
+.w110 { width:110px; flex:none; } .mt { margin-top:14px; } .cam { width:100%; border-radius:12px; }
+summary { cursor:pointer; padding:6px 0; }
