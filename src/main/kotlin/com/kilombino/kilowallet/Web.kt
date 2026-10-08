@@ -161,7 +161,7 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int) {
                 require(mode() == "hot") { "A watch-only wallet signs elsewhere: export the PSBT." }
                 require(Spend.concern(d) == null || b.optBoolean("acceptFee")) { Spend.concern(d)!! }
                 val signed = Spend.sign(recheck(b), d)
-                val txid = w.broadcast(signed.rawHex)
+                val txid = w.broadcast(signed.rawHex).also { w.noteSent(it) }
                 d.changeIndex?.let { w.freshChange() }
                 drafts.remove(d.id)
                 reply(ex, 200, JSONObject().put("txid", txid))
@@ -177,7 +177,7 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int) {
                 val d = drafts[b.getString("draft")] ?: error("This review is no longer open: prepare it again.")
                 val returned = runCatching { Psbt.decodeText(b.getString("psbt")) }.getOrElse { error("That is not a PSBT (base64 or hex).") }
                 val signed = Spend.finishPsbt(w, d, returned, cfg().optString("keyOrigin"))
-                val txid = w.broadcast(signed.rawHex)
+                val txid = w.broadcast(signed.rawHex).also { w.noteSent(it) }
                 d.changeIndex?.let { w.freshChange() }
                 drafts.remove(d.id)
                 reply(ex, 200, JSONObject().put("txid", txid))

@@ -122,20 +122,40 @@ class NodeWallet(private val dir: File, private val rpc: Rpc, accountKey: String
         }.sortedByDescending { it.value }
     }
 
+    private val txCache = java.util.concurrent.ConcurrentHashMap<String, Tx>()
+    private val sentFile = File(dir, "sent.json")
+
+    /** Transactions this server broadcast: a payment to ourselves only (a CPFP, a consolidation)
+     *  never shows in listtransactions, which leaves change out. */
+    @Synchronized fun noteSent(txid: String) {
+        val a = if (sentFile.exists()) JSONArray(sentFile.readText()) else JSONArray()
+        a.put(txid); sentFile.writeText(a.toString())
+    }
+    private fun sent(): List<String> = if (sentFile.exists()) JSONArray(sentFile.readText()).let { a -> (0 until a.length()).map { a.getString(it) } } else emptyList()
+
     /** Movements, newest first: what each transaction did to the wallet (a send includes its fee). */
     fun transactions(count: Int = 500): List<Tx> {
         val r = rpc.call("listtransactions", "*", count, 0, true, wallet = name) as JSONArray
-        val byTx = LinkedHashMap<String, MutableList<JSONObject>>()
-        for (k in 0 until r.length()) r.getJSONObject(k).let { byTx.getOrPut(it.getString("txid")) { mutableListOf() } += it }
-        // Anything that touched an address marks it used, so receive() moves on.
-        val by = scripts().entries.associate { (s, bi) -> address(bi.first, bi.second) to bi }
-        return byTx.map { (txid, es) ->
-            es.forEach { e -> by[e.optString("address")]?.let { (b, i) -> bump(b, i + 1) } }
-            val fee = es.firstOrNull { it.has("fee") }?.let { sats(-it.getDouble("fee")) }
-            val net = es.sumOf { sats(it.getDouble("amount")) } - (fee ?: 0)
-            val first = es.first()
-            Tx(txid, net, first.optInt("confirmations"), first.optLong("time"), fee)
-        }.filter { it.confirmations >= 0 }.sortedWith(compareBy({ it.confirmations > 0 }, { -it.time }))
+        val by = scripts().entries.associate { (_, bi) -> address(bi.first, bi.second) to bi }
+        val ids = LinkedHashSet<String>()
+        for (k in 0 until r.length()) r.getJSONObject(k).let { e ->
+            ids += e.getString("txid")
+            by[e.optString("address")]?.let { (b, i) -> bump(b, i + 1) } // anything that touched an address marks it used
+        }
+        ids += sent()
+        (rpc.call("listunspent", 0, 9_999_999, JSONArray(), true, wallet = name) as JSONArray).let { u -> for (k in 0 until u.length()) ids += u.getJSONObject(k).getString("txid") }
+        return ids.mapNotNull { txid ->
+            txCache[txid]?.let { return@mapNotNull it }
+            val t = runCatching { rpc.call("gettransaction", txid, true, wallet = name) as JSONObject }.getOrNull() ?: return@mapNotNull null
+            // amount leaves change out; with the fee it is exactly what the wallet gained or lost.
+            val fee = if (t.has("fee")) sats(-t.getDouble("fee")) else null
+            val tx = Tx(txid, sats(t.getDouble("amount")) - (fee ?: 0), t.optInt("confirmations"), t.optLong("time"), fee)
+            if (tx.confirmations >= 6) txCache[txid] = tx
+            tx
+        }.filter { t ->
+            // A pending one that is no longer in the mempool was replaced (RBF) or dropped: not a movement.
+            t.confirmations > 0 || (t.confirmations == 0 && runCatching { rpc.call("getmempoolentry", t.txid) }.isSuccess)
+        }.sortedWith(compareBy({ it.confirmations > 0 }, { if (it.confirmations > 0) it.confirmations.toLong() else -it.time }))
     }
 
     fun rawTx(txid: String): String = rpc.call("getrawtransaction", txid) as String
