@@ -1,5 +1,8 @@
 package com.kilombino.kilowallet
 
+import com.kilombino.pyblockwatch.coinjoin.CoinjoinTx
+import com.kilombino.pyblockwatch.coinjoin.PoolSession
+import com.kilombino.pyblockwatch.coinjoin.Protocol
 import com.kilombino.pyblockwatch.crypto.Bip32
 import com.kilombino.pyblockwatch.crypto.Bip39
 import com.kilombino.pyblockwatch.crypto.Hashes.toHex
@@ -35,8 +38,16 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int) {
     private val server = HttpServer.create(InetSocketAddress(port), 0)
     private val rnd = SecureRandom()
     @Volatile private var market: JSONObject? = null
+    /** Coinjoin rounds of this wallet (the app's COINJOIN tab). */
+    val coinjoin = Coinjoin(dir, rpc) { wallet }
+    /** Open pools as last listed, so a join is checked against what the user saw. */
+    @Volatile private var pools: List<Protocol.Terms> = emptyList()
+    /** Mixed-coin warnings of the open reviews, by draft id. */
+    private val mixWarnings = ConcurrentHashMap<String, String>()
 
     init {
+        coinjoin.secretProvider = { secret }
+        coinjoin.load(); coinjoin.startAll(); coinjoin.startPoolWatcher()
         server.executor = Executors.newFixedThreadPool(8)
         server.createContext("/") { ex -> runCatching { route(ex) }.onFailure { e -> runCatching { reply(ex, 400, err(e.message ?: "error")) } } }
         openWallet()
@@ -132,6 +143,12 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int) {
 
     private fun route(ex: HttpExchange) {
         val p = ex.requestURI.path
+        // For the StartOS side only (same container): coinjoin events after a timestamp, to notify.
+        if (p == "/internal/events") {
+            if (!ex.remoteAddress.address.isLoopbackAddress) return reply(ex, 404, err("not found"))
+            val since = ex.requestURI.query?.substringAfter("since=")?.substringBefore('&')?.toLongOrNull() ?: 0L
+            return reply(ex, 200, JSONArray(coinjoin.events.filter { it.at > since }.map { eventJson(it) }))
+        }
         if (!p.startsWith("/api/")) return static(ex, if (p == "/") "index.html" else p.removePrefix("/"))
         if (p == "/api/state") return reply(ex, 200, JSONObject().put("mode", mode()).put("unlocked", authed(ex))
             .put("version", javaClass.`package`?.implementationVersion ?: VERSION))
@@ -152,23 +169,27 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int) {
             "/api/send/prepare" -> {
                 val chosen = b.optJSONArray("coins")?.let { a -> (0 until a.length()).map { a.getString(it) }.toSet() } ?: emptySet()
                 val amount = b.optLong("amount", 0).takeIf { it > 0 && !b.optBoolean("max") }
-                review(ex, Spend.plan(w, w.utxos(), chosen, resolve(b.getString("to")), amount, b.getDouble("rate")))
+                review(ex, w, planSend(w, chosen, resolve(b.getString("to")), amount, b.getDouble("rate")))
             }
-            "/api/bump" -> review(ex, Spend.bump(w, b.getString("txid"), b.getDouble("rate"), ours(w)))
-            "/api/cpfp" -> review(ex, Spend.cpfp(w, b.getString("txid"), b.getDouble("rate"), w.utxos()))
+            "/api/bump" -> review(ex, w, Spend.bump(w, b.getString("txid"), b.getDouble("rate"), ours(w)).also { requireUnlocked(it) })
+            "/api/cpfp" -> review(ex, w, Spend.cpfp(w, b.getString("txid"), b.getDouble("rate"), spendable(w)))
             "/api/send/confirm" -> {
                 val d = drafts[b.getString("draft")] ?: error("This review is no longer open: prepare it again.")
                 require(mode() == "hot") { "A watch-only wallet signs elsewhere: export the PSBT." }
                 require(Spend.concern(d) == null || b.optBoolean("acceptFee")) { Spend.concern(d)!! }
+                mixWarnings[d.id]?.let { m -> require(b.optBoolean("acceptMix")) { m } }
+                requireUnlocked(d)
                 val signed = Spend.sign(recheck(b), d)
                 val txid = w.broadcast(signed.rawHex).also { w.noteSent(it) }
                 d.changeIndex?.let { w.freshChange() }
-                drafts.remove(d.id)
+                drafts.remove(d.id); mixWarnings.remove(d.id)
                 reply(ex, 200, JSONObject().put("txid", txid))
             }
             "/api/psbt/export" -> {
                 val d = drafts[b.getString("draft")] ?: error("This review is no longer open: prepare it again.")
                 require(Spend.concern(d) == null || b.optBoolean("acceptFee")) { Spend.concern(d)!! }
+                mixWarnings[d.id]?.let { m -> require(b.optBoolean("acceptMix")) { m } }
+                requireUnlocked(d)
                 saveCfg { it.put("keyOrigin", b.optString("origin")) }
                 val psbt = Spend.psbt(w, d, b.optString("origin"))
                 reply(ex, 200, JSONObject().put("psbt", Psbt.base64(psbt)))
@@ -176,10 +197,11 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int) {
             "/api/psbt/import" -> {
                 val d = drafts[b.getString("draft")] ?: error("This review is no longer open: prepare it again.")
                 val returned = runCatching { Psbt.decodeText(b.getString("psbt")) }.getOrElse { error("That is not a PSBT (base64 or hex).") }
+                requireUnlocked(d)
                 val signed = Spend.finishPsbt(w, d, returned, cfg().optString("keyOrigin"))
                 val txid = w.broadcast(signed.rawHex).also { w.noteSent(it) }
                 d.changeIndex?.let { w.freshChange() }
-                drafts.remove(d.id)
+                drafts.remove(d.id); mixWarnings.remove(d.id)
                 reply(ex, 200, JSONObject().put("txid", txid))
             }
             "/api/contacts" -> {
@@ -212,13 +234,196 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int) {
             "/api/rescan" -> { Thread { runCatching { w.rescan(b.optInt("from", 0)) } }.start(); reply(ex, 200, ok()) }
             "/api/forget" -> {
                 recheck(b)
+                require(coinjoin.live().isEmpty()) { "A coin of this wallet is in a coinjoin round: leave the pool first." }
+                coinjoin.clear()
                 saveCfg { it.remove("accountKey"); it.remove("mode"); it.remove("type") }
                 File(dir, "vault.json").delete()
                 wallet = null; secret = null; token = null
                 reply(ex, 200, ok())
             }
+            else -> if (p.startsWith("/api/coinjoin")) coinjoinRoute(ex, p, b, w) else reply(ex, 404, err("not found"))
+        }
+    }
+
+    // ------------------------------------------------------------------ coinjoin
+
+    /** Coins a normal send may use: not promised to a coinjoin round. */
+    private fun spendable(w: NodeWallet): List<NodeWallet.Utxo> {
+        val locked = coinjoin.lockedOutpoints()
+        return w.utxos().filter { it.outpoint !in locked }
+    }
+
+    private fun requireUnlocked(d: Spend.Draft) {
+        val locked = coinjoin.lockedOutpoints()
+        require(d.inputs.none { it.outpoint in locked }) { "A coin of this send is in a coinjoin round right now: leave the pool first, or pick other coins." }
+    }
+
+    private fun isMixed(w: NodeWallet, u: NodeWallet.Utxo, mixed: Set<String>) = w.script(u.branch, u.index).toHex() in mixed
+
+    /**
+     * A send, with coins in a live round left out. Without coin control, unmixed coins are
+     * tried first, so a mixed coin is never pulled in with others unless nothing else covers it.
+     */
+    private fun planSend(w: NodeWallet, chosen: Set<String>, to: String, amount: Long?, rate: Double): Spend.Draft {
+        val locked = coinjoin.lockedOutpoints()
+        require(chosen.none { it in locked }) { "A chosen coin is in a coinjoin round right now." }
+        val coins = spendable(w)
+        if (chosen.isEmpty() && amount != null) {
+            val mixed = coinjoin.mixedScripts()
+            val plain = coins.filter { !isMixed(w, it, mixed) }
+            if (plain.size in 1 until coins.size) runCatching { return Spend.plan(w, plain, chosen, to, amount, rate) }
+        }
+        return Spend.plan(w, coins, chosen, to, amount, rate)
+    }
+
+    /** A warning when the send would undo a mix: a mixed coin spent with others ties them together again. */
+    private fun mixWarning(w: NodeWallet, d: Spend.Draft): String? {
+        val mixed = coinjoin.mixedScripts()
+        if (mixed.isEmpty() || d.cpfpParent != null || d.replaces != null) return null
+        val nMixed = d.inputs.count { isMixed(w, it, mixed) }
+        return when {
+            nMixed > 0 && d.inputs.size > nMixed -> "You are spending mixed and unmixed coins together: anyone can link them again, which undoes the coinjoin."
+            nMixed > 1 -> "You are spending several mixed coins together: they become linked to each other."
+            nMixed > 0 && d.change > 0 -> "Spending part of a mixed coin leaves change that is tied to this payment."
+            else -> null
+        }
+    }
+
+    /** Only a hot wallet of native SegWit coins can join (the app's rule): every input and output must look alike. */
+    private fun coinjoinBlocker(): String? = when {
+        mode() != "hot" -> "Coinjoin needs a wallet that can sign here: a watch-only wallet can't prove it owns a coin or sign the round."
+        type() != ScriptType.P2WPKH -> "Coinjoin needs native SegWit (bc1q) addresses: every coin and output in a round must look the same, or yours would stand out."
+        else -> null
+    }
+
+    private fun cjCoin(w: NodeWallet, outpoint: String): NodeWallet.Utxo {
+        require(outpoint !in coinjoin.lockedOutpoints()) { "That coin is already in a round." }
+        val u = w.utxos().firstOrNull { it.outpoint == outpoint } ?: error("That coin is gone: reload the page.")
+        require(u.confirmations > 0) { "Pick a confirmed coin." }
+        return u
+    }
+
+    private fun coinjoinRoute(ex: HttpExchange, p: String, b: JSONObject, w: NodeWallet) {
+        val post = ex.requestMethod == "POST"
+        when (p) {
+            "/api/coinjoin" -> reply(ex, 200, coinjoinJson(w))
+            "/api/coinjoin/enable" -> { coinjoin.setSetting("enabled", b.optBoolean("on", true)); reply(ex, 200, coinjoinJson(w)) }
+            "/api/coinjoin/events" -> reply(ex, 200, JSONArray(coinjoin.events.map { eventJson(it) }))
+            "/api/coinjoin/settings" -> {
+                if (post) {
+                    for (k in listOf("notify_new_pools", "auto_sign")) if (b.has(k)) coinjoin.setSetting(k, b.getBoolean(k))
+                    if (b.has("telegram_token")) coinjoin.setSetting("telegram_token", b.getString("telegram_token").trim())
+                    if (b.has("telegram_chat")) coinjoin.setSetting("telegram_chat", b.getString("telegram_chat").trim())
+                }
+                reply(ex, 200, cjSettingsJson())
+            }
+            "/api/coinjoin/telegram/test" -> {
+                require(coinjoin.settings().optString("telegram_token").isNotEmpty() && coinjoin.settings().optString("telegram_chat").isNotEmpty()) {
+                    "Save the bot token and your chat id first."
+                }
+                val r = coinjoin.telegram("Kilowallet: test message. Coinjoin pool events will arrive here.")
+                reply(ex, if (r.isSuccess) 200 else 400, if (r.isSuccess) ok() else err(r.exceptionOrNull()?.message ?: "failed"))
+            }
+            else -> {
+                require(coinjoin.enabled) { "Turn coinjoin on first." }
+                coinjoinBlocker()?.let { error(it) }
+                coinjoinAction(ex, p, b, w)
+            }
+        }
+    }
+
+    private fun coinjoinAction(ex: HttpExchange, p: String, b: JSONObject, w: NodeWallet) {
+        when (p) {
+            "/api/coinjoin/pools" -> {
+                val list = runCatching { coinjoin.fetchPools() }.getOrElse { error("Could not reach the relay: ${it.message}") }
+                pools = list
+                reply(ex, 200, JSONArray(list.map { termsJson(it) }))
+            }
+            "/api/coinjoin/create" -> {
+                val amount = b.optLong("amount", 0); val rate = b.optDouble("feeRate", 0.0)
+                val maxPeers = b.optInt("maxPeers", 5); val minPeers = b.optInt("minPeers", 2); val hours = b.optInt("hours", 6)
+                require(amount in Protocol.MIN_AMOUNT..Protocol.MAX_AMOUNT) { "Amount: ${Protocol.MIN_AMOUNT} to ${Protocol.MAX_AMOUNT} sats (1 BTC)." }
+                require(rate in 1.0..500.0) { "Fee: 1 to 500 sat/vB." }
+                require(maxPeers in Protocol.MIN_PEERS..Protocol.MAX_PEERS) { "Most people: ${Protocol.MIN_PEERS} to ${Protocol.MAX_PEERS}." }
+                require(minPeers in Protocol.MIN_PEERS..maxPeers) { "Fewest people: ${Protocol.MIN_PEERS} to $maxPeers (the most)." }
+                require(hours in 1..72) { "Open for 1 to 72 hours." }
+                val u = cjCoin(w, b.getString("coin"))
+                require(u.value >= CoinjoinTx.minimumCoin(amount, rate)) { "That coin is too small for this pool." }
+                val s = recheck(b)
+                val st = coinjoin.create(s, w, u, amount, rate, minPeers, maxPeers, hours, b.optString("poolPassword"))
+                reply(ex, 200, JSONObject().put("pool", st.poolId))
+            }
+            "/api/coinjoin/join" -> {
+                val id = b.getString("pool")
+                val t = pools.firstOrNull { it.id == id }
+                    ?: runCatching { coinjoin.fetchPools() }.getOrNull()?.also { pools = it }?.firstOrNull { it.id == id }
+                    ?: error("That pool is no longer open.")
+                require(!t.private || b.optString("poolPassword").isNotEmpty()) { "Type the pool's password first." }
+                val u = cjCoin(w, b.getString("coin"))
+                require(u.value >= CoinjoinTx.minimumCoin(t.amount, t.feeRate)) { "That coin is too small for this pool." }
+                val s = recheck(b)
+                coinjoin.join(s, w, u, t, b.optString("poolPassword"))
+                reply(ex, 200, ok())
+            }
+            "/api/coinjoin/close" -> { coinjoin.session(b.getString("pool")).requestClose(); reply(ex, 200, ok()) }
+            "/api/coinjoin/vote" -> { coinjoin.session(b.getString("pool")).vote(b.getBoolean("accept")); reply(ex, 200, ok()) }
+            "/api/coinjoin/sign" -> { coinjoin.sign(recheck(b), b.getString("pool")); reply(ex, 200, ok()) }
+            "/api/coinjoin/leave" -> { coinjoin.session(b.getString("pool")).leave(); reply(ex, 200, ok()) }
+            "/api/coinjoin/remove" -> { coinjoin.remove(b.getString("pool")); reply(ex, 200, ok()) }
+            // The perfect coin for a pool: a payment to a fresh address of this wallet nobody has seen.
+            "/api/coinjoin/exact" -> {
+                val (i, script) = w.reserveReceive()
+                reply(ex, 200, JSONObject().put("index", i).put("address", Spend.addressOf(script)))
+            }
             else -> reply(ex, 404, err("not found"))
         }
+    }
+
+    private fun cjSettingsJson() = coinjoin.settings().let { c ->
+        // The bot token is never sent back, only whether it is set.
+        JSONObject().put("notify_new_pools", coinjoin.notifyNewPools).put("auto_sign", coinjoin.autoSign)
+            .put("telegram_set", c.optString("telegram_token").isNotEmpty()).put("telegram_chat", c.optString("telegram_chat"))
+    }
+
+    private fun eventJson(e: Coinjoin.Event) = JSONObject().put("at", e.at).put("title", e.title).put("text", e.text).put("pool", e.pool ?: "")
+
+    private fun termsJson(t: Protocol.Terms) = JSONObject()
+        .put("id", t.id).put("amount", t.amount).put("feeRate", t.feeRate).put("peers", t.peers)
+        .put("minPeers", t.minPeers).put("maxPeers", t.maxPeers).put("expiresAt", t.expiresAt).put("private", t.private)
+        .put("feeWithChange", CoinjoinTx.feeShare(t.feeRate, true)).put("feeNoChange", CoinjoinTx.feeShare(t.feeRate, false))
+
+    private fun coinjoinJson(w: NodeWallet): JSONObject {
+        val o = JSONObject().put("enabled", coinjoin.enabled).put("relay", Protocol.RELAY)
+            .put("blocker", coinjoinBlocker() ?: JSONObject.NULL).put("settings", cjSettingsJson())
+            .put("unlockedForAutoSign", secret != null)
+            .put("limits", JSONObject().put("minAmount", Protocol.MIN_AMOUNT).put("maxAmount", Protocol.MAX_AMOUNT)
+                .put("minPeers", Protocol.MIN_PEERS).put("maxPeers", Protocol.MAX_PEERS).put("voteMinutes", Protocol.VOTE_SECONDS / 60)
+                .put("joinMinutes", PoolSession.JOIN_TIMEOUT / 60).put("dust", CoinjoinTx.DUST))
+        o.put("mine", JSONArray(coinjoin.states().map { stateJson(it) }))
+        if (coinjoin.enabled && coinjoinBlocker() == null) {
+            val locked = coinjoin.lockedOutpoints(); val mixed = coinjoin.mixedScripts()
+            val us = runCatching { w.utxos() }.getOrDefault(emptyList())
+            o.put("coins", JSONArray(us.map { u ->
+                JSONObject().put("outpoint", u.outpoint).put("value", u.value).put("confirmations", u.confirmations)
+                    .put("mixed", isMixed(w, u, mixed)).put("change", u.branch == 1).put("inRound", u.outpoint in locked)
+            }))
+        }
+        return o
+    }
+
+    private fun stateJson(st: PoolSession.State): JSONObject {
+        val plan = runCatching { coinjoin.session(st.poolId).plan() }.getOrNull()
+        val people = if (st.round.isNotEmpty()) st.round.size else st.seats.size
+        return JSONObject().put("id", st.poolId).put("amount", st.terms.amount).put("feeRate", st.terms.feeRate)
+            .put("creator", st.creator).put("private", st.terms.private).put("phase", st.phase.name).put("reason", st.reason)
+            .put("people", people).put("minPeers", st.terms.minPeers).put("maxPeers", st.terms.maxPeers)
+            .put("expiresAt", st.terms.expiresAt).put("phaseDeadline", st.phaseDeadline).put("voteDeadline", st.voteDeadline)
+            .put("coinValue", st.seat.coin.value).put("change", st.seat.changeValue)
+            .put("iAsked", st.voteBy != null && st.voteBy == st.token?.let { Protocol.tokenHash(it) })
+            .put("voted", st.votedOn != null && st.votedOn == st.voteId)
+            .put("signed", st.postedSig).put("sigs", st.sigs.size).put("txid", st.txid ?: "")
+            .put("planFee", plan?.fee ?: 0).put("planPeople", plan?.coins?.size ?: 0)
+            .put("planIdentical", plan?.outputs?.count { it.value == st.terms.amount } ?: 0)
     }
 
     /** A user@domain handle isn't resolved on the server yet: only addresses. */
@@ -234,13 +439,15 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int) {
         return m
     }
 
-    private fun review(ex: HttpExchange, d: Spend.Draft) {
+    private fun review(ex: HttpExchange, w: NodeWallet, d: Spend.Draft) {
         drafts[d.id] = d
+        val mix = mixWarning(w, d)?.also { mixWarnings[d.id] = it }
         reply(ex, 200, JSONObject().put("draft", d.id).put("to", d.toAddress).put("amount", d.amount).put("fee", d.fee)
             .put("change", d.change).put("inputs", d.inputs.size).put("vbytes", d.vbytes)
             .put("rate", d.fee / d.vbytes).put("concern", Spend.concern(d) ?: JSONObject.NULL)
             .put("replaces", d.replaces ?: JSONObject.NULL).put("replacedFee", d.replacedFee)
-            .put("cpfpParent", d.cpfpParent ?: JSONObject.NULL).put("packageRate", d.packageRate))
+            .put("cpfpParent", d.cpfpParent ?: JSONObject.NULL).put("packageRate", d.packageRate)
+            .put("mixWarning", mix ?: JSONObject.NULL))
     }
 
     // ------------------------------------------------------------------ setup
@@ -315,10 +522,12 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int) {
         }
         val utxos = w.utxos()
         val (ri, ra) = w.receive()
+        val locked = coinjoin.lockedOutpoints(); val mixed = coinjoin.mixedScripts()
         o.put("confirmed", conf).put("pending", pending).put("transactions", txArr)
             .put("coins", JSONArray(utxos.map { u ->
                 JSONObject().put("outpoint", u.outpoint).put("value", u.value).put("confirmations", u.confirmations)
                     .put("address", w.address(u.branch, u.index)).put("change", u.branch == 1)
+                    .put("mixed", isMixed(w, u, mixed)).put("inRound", u.outpoint in locked)
             }))
             .put("receive", JSONObject().put("index", ri).put("address", ra).put("path", "${ri}"))
             .put("height", runCatching { rpc.height() }.getOrDefault(0))
@@ -329,5 +538,5 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int) {
         return o
     }
 
-    companion object { const val VERSION = "0.1.0" }
+    companion object { const val VERSION = "0.2.0-beta1" }
 }

@@ -51,6 +51,12 @@ class NodeWallet(private val dir: File, private val rpc: Rpc, accountKey: String
     /** A fresh change script, reserved so the next send does not reuse it. */
     @Synchronized fun freshChange(): Pair<Int, ByteArray> { val i = top(1); bump(1, i + 1); return i to script(1, i) }
     fun peekChange(): Pair<Int, ByteArray> { val i = top(1); return i to script(1, i) }
+    /**
+     * A fresh receive script nobody has been shown (a coinjoin's mixed output, an exact coin):
+     * the address on screen may already be with someone, so it is skipped, and the page moves
+     * on to the next one.
+     */
+    @Synchronized fun reserveReceive(): Pair<Int, ByteArray> { val i = top(0) + 1; bump(0, i + 1); return i to script(0, i) }
 
     /** branch/index of each script we hand out or watch, for matching node results back. */
     private fun scripts(): Map<String, Pair<Int, Int>> {

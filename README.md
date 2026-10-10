@@ -12,6 +12,13 @@ phone, that reads the chain straight from your own node — no Electrum server.
 - **Watch-only wallets send through a PSBT**, checked on the way back like in the app.
 - Coin control, RBF, CPFP, a second confirmation for a fee that looks like a slip, contacts,
   street mode, USD/EUR prices (optional).
+- **Coinjoin** (beta, opt-in): the app's COINJOIN tab, in the same pools as the app and
+  [Kilojoin](https://github.com/Kilombino/kilojoin) (relay.kilombino.com, the app's own protocol
+  code). Open or join pools with one coin, ask to close, accept or refuse, sign after the server
+  checks your output, change and fee; coins in a live round are left out of sends, and mixed coins
+  are flagged so they are not spent together with others. Alerts through your own Telegram bot,
+  a sound in the browser, StartOS notifications, and an optional sign-on-its-own. Native SegWit
+  (bc1q) hot wallets only.
 
 Packaged for StartOS in [kilowallet-startos](https://github.com/Kilombino/kilowallet-startos).
 

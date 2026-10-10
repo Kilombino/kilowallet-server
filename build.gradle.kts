@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "com.kilombino.kilowallet"
-version = "0.1.0"
+version = "0.2.0-beta1"
 
 kotlin {
     jvmToolchain(17)
@@ -22,6 +22,13 @@ sourceSets {
             include("com/kilombino/kilowallet/**")
             include("com/kilombino/pyblockwatch/crypto/**")
             include("com/kilombino/pyblockwatch/ark/ArkNativeStub.kt") // no Ark engine library here: Kotlin signing
+            // Coinjoin: the app's own protocol code, so this server meets phones and Kilojoin nodes in the same pools.
+            include("com/kilombino/pyblockwatch/coinjoin/CoinjoinTx.kt")
+            include("com/kilombino/pyblockwatch/coinjoin/Nip44.kt")
+            include("com/kilombino/pyblockwatch/coinjoin/NostrEvent.kt")
+            include("com/kilombino/pyblockwatch/coinjoin/PoolSession.kt")
+            include("com/kilombino/pyblockwatch/coinjoin/Protocol.kt")
+            include("com/kilombino/pyblockwatch/coinjoin/RelayClient.kt")
         }
     }
 }

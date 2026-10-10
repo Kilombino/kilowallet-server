@@ -35,3 +35,5 @@ label.check { display:flex; gap:10px; align-items:center; margin:8px 0; cursor:p
 .pill { display:inline-block; padding:2px 8px; border-radius:10px; background:var(--soft); color:var(--text-soft); font-size:10px; }
 .w110 { width:110px; flex:none; } .mt { margin-top:14px; } .cam { width:100%; border-radius:12px; }
 summary { cursor:pointer; padding:6px 0; }
+/* Coinjoin: the coin picker. */
+.pick { cursor:pointer; border-radius:10px; padding:10px; margin:2px 0; } .pick.sel { background:rgba(185,107,255,.15); }

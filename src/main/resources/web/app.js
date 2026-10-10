@@ -51,12 +51,14 @@ async function boot() {
   S.me = await api('state');
   if (S.me.unlocked) await loadWallet();
   render();
-  setInterval(async () => { if (S.me && S.me.unlocked && !S.sheet && document.visibilityState === 'visible') { await loadWallet().catch(() => {}); render(); } }, 30000);
+  setInterval(async () => { if (S.me && S.me.unlocked && !busy() && document.visibilityState === 'visible') { await loadWallet().catch(() => {}); if (!busy()) render(); } }, 30000);
+  startCoinjoinTimers();
   // Leaving the page puts street mode back on (as the app does).
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden' && S.w) { S.street = S.w.settings.streetDefault; render(); } });
 }
 async function loadWallet() {
   S.w = await api('wallet');
+  if (!C.st) loadCoinjoin().catch(() => {});
   if (S.street === true && S.w.settings && !S.w.settings.streetDefault && !loadWallet.done) S.street = false;
   loadWallet.done = true;
 }
@@ -128,11 +130,14 @@ function mainView() {
       h('button', { class: 'link', onclick: () => { S.showSettings = !S.showSettings; render(); } }, S.showSettings ? 'close' : 'settings'),
       h('button', { class: 'link faint', onclick: () => api('lock', {}).then(() => { S.me.unlocked = false; S.w = null; render(); }) }, 'lock')));
   if (S.newWords) return h('div', {}, top, newWordsPanel());
+  const tabs = h('div', { class: 'tabs mt' }, [['btc', 'BTC'], ['coinjoin', 'COINJOIN']].map(([k, label]) =>
+    h('button', { class: S.tab === k ? 'on' : '', onclick: () => openTab(k) }, label)));
+  if (S.tab === 'coinjoin' && !w.error && !w.importing) return h('div', {}, top, tabs, S.showSettings ? settingsPanel() : null, coinjoinView());
   if (w.error) return h('div', {}, top, h('div', { class: 'panel bad' }, h('div', { class: 'label' }, 'Node'), h('p', {}, w.error)));
   if (w.importing) return h('div', {}, top, h('div', { class: 'panel' }, h('div', { class: 'label' }, 'Reading your history'),
     h('p', { class: 'soft' }, 'The node is looking through the chain for this wallet\'s coins and movements. It can take from a minute to a while; this page updates by itself.')));
   const total = (w.confirmed || 0) + (w.pending || 0);
-  const parts = [top,
+  const parts = [top, tabs,
     h('div', { class: 'panel' },
       h('div', { class: 'between' }, h('div', { class: 'label' }, 'BTC balance'),
         h('button', { class: 'link', onclick: () => { S.street = !S.street; render(); } }, S.street ? '👁 show' : '🙈 hide')),
@@ -191,10 +196,12 @@ function sendForm() {
   const pick = contacts.length ? h('select', { onchange: e => { if (e.target.value) { f.to = e.target.value; to.value = f.to; } } },
     h('option', { value: '' }, 'CONTACTS…'), contacts.map(c => h('option', { value: c.address }, `${c.name} · ${short(c.address)}`))) : null;
   const scan = ('BarcodeDetector' in window) ? h('button', { class: 'link', onclick: () => scanQr(v => { f.to = v.replace(/^bitcoin:/i, '').split('?')[0]; to.value = f.to; }) }, '📷 SCAN') : null;
-  const coinBox = h('div', {}, (S.w.coins || []).map(c => h('label', { class: 'check small' },
-    h('input', { type: 'checkbox', checked: f.coins.has(c.outpoint), onchange: e => { e.target.checked ? f.coins.add(c.outpoint) : f.coins.delete(c.outpoint); } }),
-    h('span', { class: 'grow' }, `${street(sats(c.value) + ' sats')} · ${c.confirmations} conf${c.change ? ' · change' : ''}`))));
-  const cc = h('details', {}, h('summary', { class: 'soft small' }, 'Coin control'), coinBox);
+  const coinBox = h('div', {}, (S.w.coins || []).map(c => h('label', { class: 'check small' + (c.inRound ? ' faint' : '') },
+    h('input', { type: 'checkbox', disabled: c.inRound, checked: f.coins.has(c.outpoint) && !c.inRound, onchange: e => { e.target.checked ? f.coins.add(c.outpoint) : f.coins.delete(c.outpoint); } }),
+    h('span', { class: 'grow' }, `${street(sats(c.value) + ' sats')} · ${c.confirmations} conf${c.change ? ' · change' : ''}`,
+      c.mixed ? h('span', { class: 'good' }, ' · mixed') : null, c.inRound ? h('span', { class: 'warnc' }, ' · in a coinjoin round') : null))));
+  const coinNote = (S.w.coins || []).some(c => c.mixed) ? h('p', { class: 'faint small' }, 'Never spend a mixed coin together with other coins: that links them again.') : null;
+  const cc = h('details', { open: f.coins.size > 0 }, h('summary', { class: 'soft small' }, 'Coin control'), coinNote, coinBox);
   return h('div', {},
     h('div', { class: 'row' }, h('div', { class: 'grow' }, to), scan),
     h('div', { class: 'row' },
@@ -212,6 +219,8 @@ function sendForm() {
 function reviewView(d) {
   const hot = S.me.mode === 'hot';
   const feeOk = h('input', { type: 'checkbox' });
+  const mixOk = h('input', { type: 'checkbox' });
+  feeOk.mixOk = mixOk;
   const pw = h('input', { type: 'password', placeholder: 'password, to sign', autocomplete: 'current-password' });
   const rows = [
     d.cpfpParent ? h('p', { class: 'small soft' }, 'Pulls the stuck payment along: a payment to yourself that spends what it brought you, with a fee big enough for both.') : null,
@@ -224,11 +233,14 @@ function reviewView(d) {
     h('div', { class: 'between' }, h('span', { class: 'soft' }, 'Inputs'), h('span', {}, d.inputs)),
     h('p', { class: 'faint small' }, 'Signed with the unified sighash: valid only on BTC, it can\'t be replayed on the spamchain.'),
     d.concern ? h('div', {}, h('p', { class: 'badc small' }, '⚠ ' + d.concern + ' Check it before signing: a fee can\'t be taken back.'),
-      h('label', { class: 'check small' }, feeOk, 'Yes, I want to pay this fee')) : null];
+      h('label', { class: 'check small' }, feeOk, 'Yes, I want to pay this fee')) : null,
+    d.mixWarning ? h('div', {}, h('p', { class: 'warnc small' }, '⚠ ' + d.mixWarning),
+      h('label', { class: 'check small' }, mixOk, 'I understand, send it anyway')) : null];
   if (hot) return h('div', {}, rows, pw,
     h('div', { class: 'btns' }, h('button', { class: 'primary', onclick: () => {
       if (d.concern && !feeOk.checked) return toast('Tick the box to confirm the fee.');
-      api('send/confirm', { draft: d.draft, password: pw.value, acceptFee: feeOk.checked }).then(r => { S.sent = r.txid; S.draft = null; S.form = null; loadWallet().then(render); render(); }).catch(e => toast(e.message));
+      if (d.mixWarning && !mixOk.checked) return toast('Tick the box under the coinjoin warning.');
+      api('send/confirm', { draft: d.draft, password: pw.value, acceptFee: feeOk.checked, acceptMix: mixOk.checked }).then(r => { S.sent = r.txid; S.draft = null; S.form = null; loadWallet().then(render); render(); }).catch(e => toast(e.message));
     } }, 'CONFIRM & SIGN')),
     h('button', { class: 'link faint', onclick: () => { S.draft = null; render(); } }, 'edit'));
   return h('div', {}, rows, psbtView(d, feeOk));
@@ -240,7 +252,8 @@ function psbtView(d, feeOk) {
     return h('div', {}, origin, h('p', { class: 'faint small' }, 'Some signers need it to find their key; Bitcoin Knots does not.'),
       h('div', { class: 'btns' }, h('button', { class: 'primary', onclick: () => {
         if (d.concern && !feeOk.checked) return toast('Tick the box to confirm the fee.');
-        api('psbt/export', { draft: d.draft, origin: origin.value, acceptFee: feeOk.checked }).then(r => { S.psbt = r.psbt; render(); }).catch(e => toast(e.message));
+        if (d.mixWarning && !feeOk.mixOk.checked) return toast('Tick the box under the coinjoin warning.');
+        api('psbt/export', { draft: d.draft, origin: origin.value, acceptFee: feeOk.checked, acceptMix: feeOk.mixOk.checked }).then(r => { S.psbt = r.psbt; render(); }).catch(e => toast(e.message));
       } }, 'EXPORT PSBT')));
   }
   const back = h('textarea', { placeholder: 'paste the signed PSBT (base64 or hex)' });
@@ -289,7 +302,8 @@ function coinsPanel() {
   if (!cs.length) return null;
   return h('details', { class: 'panel' }, h('summary', { class: 'label' }, `Coins (${cs.length})`),
     cs.map(c => h('div', { class: 'tx' }, h('div', { class: 'between' }, h('span', {}, street(sats(c.value) + ' sats')), h('span', { class: 'faint small' }, `${c.confirmations} conf`)),
-      h('div', { class: 'faint small mono' }, c.address + (c.change ? ' · change' : '')))));
+      h('div', { class: 'faint small mono' }, c.address + (c.change ? ' · change' : ''),
+        c.mixed ? h('span', { class: 'good' }, ' · mixed') : null, c.inRound ? h('span', { class: 'warnc' }, ' · in a coinjoin round') : null))));
 }
 
 function modal(...kids) {
@@ -359,6 +373,376 @@ async function scanQr(done) {
   const m = modal(v, h('div', { class: 'btns' }, h('button', { class: 'soft', onclick: stop }, 'CANCEL')));
   const tick = async () => { if (!m.isConnected) return; try { const r = await det.detect(v); if (r.length) { stop(); return done(r[0].rawValue); } } catch {} requestAnimationFrame(tick); };
   tick();
+}
+
+// ------------------------------------------------------------------ coinjoin
+// The app's COINJOIN tab: your pools and what they need from you, the open pools on the relay,
+// and a form to open one. Joining and signing ask for the password (the app's fingerprint).
+
+const C = { st: null, pools: null, loading: false, msg: null, create: null, join: null, pick: null, chosen: null };
+const feeShare = (rate, withChange) => Math.ceil(rate * (68 + 31 + (withChange ? 31 : 0) + 10.5 / 2));
+const minCoin = (amount, rate) => amount + feeShare(rate, false);
+function cjChange(v, amount, rate) {
+  const w = v - amount - feeShare(rate, true);
+  if (w > ((C.st && C.st.limits.dust) || 294)) return w;
+  return v - amount - feeShare(rate, false) >= 0 ? 0 : null;
+}
+function left(at) {
+  const s = Math.floor(at - Date.now() / 1000);
+  if (s <= 0) return 'now';
+  return s < 3600 ? Math.floor(s / 60) + ' min' : Math.floor(s / 3600) + ' h ' + Math.floor((s % 3600) / 60) + ' min';
+}
+const hhmm = at => new Date(at * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+const fmtRate = r => r >= 10 ? r.toFixed(0) : (Math.round(r * 10) / 10).toString();
+const cjOpen = () => C.st && C.st.enabled && !C.st.blocker;
+
+/** Something is being typed or chosen: a refresh would wipe it, so it waits. */
+function busy() {
+  const a = document.activeElement;
+  if (a && a !== document.body && ['INPUT', 'TEXTAREA', 'SELECT'].includes(a.tagName)) return true;
+  return !!(S.sheet || C.create || C.join || document.querySelector('.modal-bg'));
+}
+
+async function loadCoinjoin() { C.st = await api('coinjoin'); }
+
+async function reloadPools() {
+  if (C.loading || !cjOpen()) return;
+  C.loading = true; if (!busy()) render();
+  try { C.pools = await api('coinjoin/pools'); }
+  // A failed look keeps the list it had: an empty screen would read as "no pools".
+  catch (e) { if (e.message !== 'locked') C.msg = e.message; }
+  C.loading = false;
+  if (!busy()) render();
+}
+
+async function openTab(k) {
+  S.tab = k; render();
+  if (k === 'coinjoin') {
+    await loadCoinjoin().catch(e => toast(e.message));
+    render();
+    reloadPools();
+  }
+}
+
+function startCoinjoinTimers() {
+  // Rounds move on their own: the tab follows them every few seconds, the open pools every minute.
+  setInterval(async () => {
+    if (!S.me || !S.me.unlocked || S.tab !== 'coinjoin' || document.visibilityState !== 'visible') return;
+    try { await loadCoinjoin(); if (!busy()) render(); } catch {}
+  }, 5000);
+  setInterval(() => { if (S.me && S.me.unlocked && S.tab === 'coinjoin' && document.visibilityState === 'visible') reloadPools(); }, 60000);
+  setInterval(pollEvents, 5000);
+}
+
+function coinjoinView() {
+  const st = C.st;
+  if (!st) return h('div', { class: 'panel' }, h('p', { class: 'faint small' }, 'Loading…'));
+  if (!st.enabled) return coinjoinIntro();
+  const parts = [h('div', { class: 'panel' }, h('div', { class: 'label' }, 'Coinjoin'),
+    h('p', { class: 'small soft' }, 'Mix a coin with other people\'s: everyone puts one coin in and gets back an output of exactly the pool\'s amount, all identical, so nobody watching the chain can tell whose is whose. Each person pays their own share of the fee from their change. No server ever holds your coins: the relay only passes encrypted messages, and you sign only after checking your output.'))];
+  if (st.blocker) { parts.push(h('div', { class: 'panel warn' }, h('p', { class: 'small' }, st.blocker))); return h('div', {}, parts); }
+  if (C.msg) parts.push(h('div', { class: 'panel warn' }, h('p', { class: 'warnc small' }, C.msg),
+    h('button', { class: 'link faint', onclick: () => { C.msg = null; render(); } }, 'ok')));
+  const mine = st.mine || [];
+  if (mine.length) parts.push(h('div', { class: 'label mt' }, 'Your pools'), mine.map(myPool));
+  if (C.pick) { parts.push(coinPicker()); return h('div', {}, parts); }
+  if (C.create) { parts.push(createForm()); return h('div', {}, parts); }
+  parts.push(h('div', { class: 'btns' }, h('button', { class: 'primary', onclick: () => {
+    C.create = { amount: '100000', rate: '1', min: '2', max: '5', hours: '6', password: '' }; render();
+  } }, '＋  OPEN A POOL')));
+  parts.push(openPools(mine), notificationsPanel(), autoSignPanel(), howPanel());
+  return h('div', {}, parts);
+}
+
+function coinjoinIntro() {
+  const min = sats(((C.st && C.st.limits) || {}).minAmount || 10000);
+  return h('div', { class: 'panel' }, h('div', { class: 'label' }, 'Coinjoin · mix your coins'),
+    h('div', { class: 'mid' }, 'Are you interested in coinjoins?'),
+    h('p', { class: 'small soft' }, 'A coinjoin puts your coin in one transaction with other people\'s. Everyone gets back an output of exactly the same amount, so nobody watching the chain can tell whose is whose.'),
+    h('p', { class: 'small soft' }, `• Someone opens a pool (from ${min} sats to 1 BTC) and others join with one coin.`, h('br'),
+      '• With enough people in, anyone asks to close and the rest accept.', h('br'),
+      '• This server checks the transaction and you sign with your password. Nobody holds your coins: the relay only passes encrypted messages.', h('br'),
+      '• Each person pays their own share of the fee.', h('br'),
+      '• Signed so it is valid only on BTC, never on the spamchain.'),
+    h('p', { class: 'small faint' }, 'If you turn it on, this tab opens up and this server starts talking to the relay (relay.kilombino.com) to list the pools. You can turn it off again here.'),
+    h('div', { class: 'btns' },
+      h('button', { class: 'soft', onclick: () => { S.tab = 'btc'; render(); } }, 'NOT NOW'),
+      h('button', { class: 'primary', onclick: () => api('coinjoin/enable', { on: true }).then(r => { C.st = r; render(); reloadPools(); }).catch(e => toast(e.message)) }, 'YES, TURN IT ON')));
+}
+
+function phaseText(p) {
+  switch (p.phase) {
+    case 'JOINING': return 'Asking to join…';
+    case 'OPEN': return `Waiting for people · ${p.people}/${p.maxPeers} · closes in ${left(p.expiresAt)}`;
+    case 'VOTING': return `Close now with ${p.people} people?`;
+    case 'CLOSING': return `Closing with ${p.people} people · collecting outputs`;
+    case 'SIGNING': return `Ready: sign within ${left(p.phaseDeadline)}`;
+    case 'BROADCAST': return 'Sent · waiting for the first confirmation';
+    case 'CONFIRMED': return 'Confirmed ✅';
+    case 'ABORTED': return 'Cancelled: ' + p.reason + '. Your coin did not move.';
+    case 'REJECTED': return 'Refused: ' + p.reason;
+  }
+  return p.phase;
+}
+
+async function cjAct(path, body) {
+  try { await api(path, body); await loadCoinjoin(); } catch (e) { if (e.message !== 'locked') C.msg = e.message; }
+  render();
+}
+
+function confirmLeave(p) {
+  let m;
+  m = modal(h('div', { class: 'label' }, p.creator ? 'End this pool?' : 'Leave this pool?'),
+    h('p', { class: 'small soft' }, p.creator
+      ? 'The round is cancelled for everyone in it, and they are told so. Nobody loses anything: no transaction exists until all have signed, so every coin stays where it is.'
+      : 'Your seat is freed and your coin is yours to spend again. Nothing was signed, so nothing moves.'),
+    h('div', { class: 'btns' }, h('button', { class: 'soft', onclick: () => m.remove() }, 'STAY'),
+      h('button', { class: 'primary', onclick: () => { m.remove(); cjAct('coinjoin/leave', { pool: p.id }); } }, p.creator ? 'END POOL' : 'LEAVE')));
+}
+
+function myPool(p) {
+  const cls = p.phase === 'CONFIRMED' ? 'good' : ['ABORTED', 'REJECTED'].includes(p.phase) ? 'badc' : ['VOTING', 'SIGNING'].includes(p.phase) ? 'warnc' : 'soft';
+  const leaveBtn = h('button', { class: 'soft', onclick: () => confirmLeave(p) }, p.creator ? 'END POOL' : 'LEAVE');
+  const acts = [];
+  if (p.phase === 'JOINING') acts.push(h('p', { class: 'faint small' }, `Waiting for the pool's creator to let you in. If nobody answers in ${C.st.limits.joinMinutes} minutes the request is dropped.`),
+    h('div', { class: 'btns' }, h('button', { class: 'soft', onclick: () => cjAct('coinjoin/leave', { pool: p.id }) }, 'CANCEL')));
+  if (p.phase === 'OPEN') {
+    acts.push(h('div', { class: 'btns' }, p.people >= p.minPeers ? h('button', { class: 'primary', onclick: () => cjAct('coinjoin/close', { pool: p.id }) }, 'ASK TO CLOSE NOW') : null, leaveBtn));
+    if (p.people < p.minPeers) acts.push(h('p', { class: 'faint small' }, `Closes once ${p.minPeers} people are in.`));
+  }
+  if (p.phase === 'VOTING') {
+    if (p.iAsked || p.voted) acts.push(h('p', { class: 'soft small' }, `Waiting for the others to answer, until ${hhmm(p.voteDeadline)}. Whoever has not answered by then is left out; if too few are left, the pool reopens without them.`),
+      h('div', { class: 'btns' }, leaveBtn));
+    else acts.push(h('p', { class: 'soft small' }, `Answer before ${hhmm(p.voteDeadline)}.`),
+      h('div', { class: 'btns' }, h('button', { class: 'primary', onclick: () => cjAct('coinjoin/vote', { pool: p.id, accept: true }) }, 'ACCEPT'),
+        h('button', { class: 'soft', onclick: () => cjAct('coinjoin/vote', { pool: p.id, accept: false }) }, 'NOT YET')));
+  }
+  if (p.phase === 'SIGNING') {
+    if (p.signed) acts.push(h('p', { class: 'soft small' }, `Signed. Waiting for the others (${p.sigs}/${p.planPeople || '?'})…`));
+    else {
+      const pw = h('input', { type: 'password', placeholder: 'password, to sign', autocomplete: 'current-password' });
+      if (p.planPeople) acts.push(h('p', { class: 'small soft' }, `Checked: ${p.planPeople} people, ${p.planIdentical} identical outputs of ${sats(p.amount)} sats, one of them yours; ` +
+        (p.change > 0 ? 'your change is right' : 'no change (an exact coin)') + `; total fee ${sats(p.planFee)} sats.`));
+      acts.push(pw, h('div', { class: 'btns' }, h('button', { class: 'primary', onclick: () => cjAct('coinjoin/sign', { pool: p.id, password: pw.value }) }, 'SIGN')));
+    }
+  }
+  if (p.txid) acts.push(h('p', { class: 'mono soft small' }, p.txid),
+    h('div', { class: 'row' }, h('button', { class: 'link', onclick: () => window.open(S.w.settings.explorer + '/tx/' + p.txid, '_blank', 'noopener') }, 'open in explorer'),
+      p.phase === 'CONFIRMED' ? h('button', { class: 'link faint', onclick: () => cjAct('coinjoin/remove', { pool: p.id }) }, 'remove') : null));
+  if (['ABORTED', 'REJECTED'].includes(p.phase)) acts.push(h('button', { class: 'link faint', onclick: () => cjAct('coinjoin/remove', { pool: p.id }) }, 'remove'));
+  return h('div', { class: 'panel' + (['VOTING', 'SIGNING'].includes(p.phase) ? ' warn' : ['ABORTED', 'REJECTED'].includes(p.phase) ? ' bad' : '') },
+    h('div', { class: 'between' }, h('span', { class: 'mid' }, sats(p.amount) + ' sats'), h('span', { class: 'faint small' }, (p.private ? '🔒 ' : '') + (p.creator ? 'your pool' : 'joined'))),
+    h('p', { class: cls + ' small' }, phaseText(p)),
+    h('p', { class: 'faint small' }, `your coin ${sats(p.coinValue)} → ${sats(p.amount)} mixed${p.change > 0 ? ' + ' + sats(p.change) + ' change' : ''} · fee ${sats(p.coinValue - p.amount - p.change)}`),
+    acts);
+}
+
+function openPools(mine) {
+  // Only rounds still running hide their pool: one that ended or was left shows again to rejoin.
+  const ours = new Set(mine.filter(m => !['ABORTED', 'REJECTED', 'CONFIRMED', 'BROADCAST'].includes(m.phase)).map(m => m.id));
+  const shown = (C.pools || []).filter(t => !ours.has(t.id));
+  return h('div', {},
+    h('div', { class: 'between mt' }, h('div', { class: 'label' }, 'Open pools'),
+      h('button', { class: 'link faint', onclick: () => reloadPools() }, C.loading ? 'looking…' : 'refresh')),
+    C.pools === null ? h('p', { class: 'faint small' }, C.loading ? 'Asking the relay…' : 'Not looked up yet.') :
+      shown.length ? shown.map(t => h('div', { class: 'panel' }, h('div', { class: 'row' },
+        h('div', { class: 'grow' },
+          h('div', { class: 'mid' }, (t.private ? '🔒 ' : '') + sats(t.amount) + ' sats'),
+          h('div', { class: 'soft small' }, `${t.peers}/${t.maxPeers} people (min ${t.minPeers}) · ${t.feeRate} sat/vB · closes in ${left(t.expiresAt)}`),
+          h('div', { class: 'faint small' }, `joining costs you ${sats(t.feeWithChange)} sats in fees (${sats(t.feeNoChange)} with a coin of exactly ${sats(t.amount + t.feeNoChange)})`)),
+        h('button', { class: 'soft', onclick: () => { C.join = { pool: t, password: '' }; C.pick = { title: 'Join · ' + sats(t.amount) + ' sats', amount: t.amount, rate: t.feeRate }; C.chosen = null; render(); } }, 'JOIN'))))
+        : h('p', { class: 'faint small' }, 'No open pools right now. Open one and others will be notified.'));
+}
+
+function createError(f) {
+  const L = C.st.limits;
+  const amount = Number(f.amount.replace(/\D/g, '')), rate = Number(f.rate.replace(',', '.')), max = Number(f.max), min = Number(f.min), hours = Number(f.hours);
+  if (!f.amount || !Number.isInteger(amount) || amount < L.minAmount || amount > L.maxAmount) return `Amount: ${sats(L.minAmount)} to ${sats(L.maxAmount)} sats (1 BTC).`;
+  if (!f.rate || !isFinite(rate) || rate < 1 || rate > 500) return 'Fee: 1 to 500 sat/vB.';
+  if (!Number.isInteger(max) || max < L.minPeers || max > L.maxPeers) return `Most people: ${L.minPeers} to ${L.maxPeers}.`;
+  if (!Number.isInteger(min) || min < L.minPeers || min > max) return `Fewest people: ${L.minPeers} to ${max} (the most).`;
+  if (!Number.isInteger(hours) || hours < 1 || hours > 72) return 'Open for 1 to 72 hours.';
+  return null;
+}
+
+function createForm() {
+  const f = C.create, L = C.st.limits;
+  const errBox = h('p', { class: 'warnc small' });
+  const btc = h('div', { class: 'faint small' });
+  const costs = h('p', { class: 'faint small' });
+  const pwNote = h('p', { class: 'faint small' });
+  const next = h('button', { class: 'primary' }, 'CHOOSE COIN');
+  const update = () => {
+    const e = createError(f);
+    errBox.textContent = e || ''; next.disabled = !!e;
+    const amount = Number(f.amount.replace(/\D/g, '')), rate = Number(f.rate.replace(',', '.'));
+    btc.textContent = amount ? '= ' + (amount / 1e8).toFixed(8) + ' BTC' : '';
+    costs.textContent = amount && rate >= 1 && rate <= 500 ? `Each person pays their own fee, the same however many join: ${feeShare(rate, true)} sats with change, ${feeShare(rate, false)} without. ` +
+      `A coin of exactly ${sats(amount + feeShare(rate, false))} sats leaves no change (the best for privacy); a bit more than that, up to ${sats(amount + feeShare(rate, true) + L.dust)}, also goes in without change and the rest goes to the miners.` : '';
+    pwNote.textContent = f.password ? 'Only people you give this password to can join. It is not announced anywhere.' : '';
+  };
+  const field = (label, k, mode) => [h('div', { class: 'soft small mt' }, label),
+    h('input', { value: f[k], inputmode: mode, oninput: e => { f[k] = e.target.value; update(); } })];
+  next.addEventListener('click', () => {
+    if (createError(f)) return;
+    C.pick = { title: 'Your coin for the pool', amount: Number(f.amount.replace(/\D/g, '')), rate: Number(f.rate.replace(',', '.')) }; C.chosen = null; render();
+  });
+  update();
+  return h('div', { class: 'panel' }, h('div', { class: 'label' }, 'Open a pool'),
+    field('amount per person (sats)', 'amount', 'numeric'), btc,
+    field('fee rate (sat/vB)', 'rate', 'decimal'),
+    field(`fewest people to close (${L.minPeers}–${L.maxPeers - 1})`, 'min', 'numeric'),
+    field(`most people (${L.minPeers}–${L.maxPeers})`, 'max', 'numeric'),
+    field('open for (hours)', 'hours', 'numeric'),
+    h('div', { class: 'soft small mt' }, 'password (optional: makes it private 🔒)'),
+    h('input', { value: f.password, autocomplete: 'off', oninput: e => { f.password = e.target.value; update(); } }), pwNote,
+    costs, errBox,
+    h('div', { class: 'btns' }, h('button', { class: 'soft', onclick: () => { C.create = null; render(); } }, 'CANCEL'), next));
+}
+
+function cancelPick() {
+  if (C.create) C.pick = null; else { C.pick = null; C.join = null; }
+  C.chosen = null; render();
+}
+
+function coinPicker() {
+  const k = C.pick, min = minCoin(k.amount, k.rate), exact = k.amount + feeShare(k.rate, false);
+  const coins = (C.st.coins || []).filter(c => !c.inRound && c.confirmations > 0);
+  const ok = coins.filter(c => c.value >= min).sort((a, b) => (a.value === min ? 0 : 1) - (b.value === min ? 0 : 1) || b.value - a.value);
+  const short = coins.filter(c => c.value >= k.amount && c.value < min).sort((a, b) => b.value - a.value);
+  const pw = h('input', { type: 'password', placeholder: 'password, to put your coin in', autocomplete: 'current-password' });
+  const poolPw = C.join && C.join.pool.private ? h('input', { placeholder: 'pool password', autocomplete: 'off', value: C.join.password, oninput: e => { C.join.password = e.target.value; } }) : null;
+  const use = h('button', { class: 'primary', disabled: !C.chosen }, C.create ? 'OPEN POOL' : 'JOIN');
+  use.addEventListener('click', async () => {
+    use.disabled = true;
+    try {
+      if (C.create) {
+        const f = C.create;
+        await api('coinjoin/create', { coin: C.chosen, amount: k.amount, feeRate: k.rate, minPeers: Number(f.min), maxPeers: Number(f.max),
+          hours: Number(f.hours), poolPassword: f.password, password: pw.value });
+        C.create = null; toast('Pool opened: others are told about it.');
+      } else {
+        if (C.join.pool.private && !C.join.password) { use.disabled = false; return toast('Type the pool\'s password first.'); }
+        await api('coinjoin/join', { pool: C.join.pool.id, coin: C.chosen, poolPassword: C.join.password, password: pw.value });
+        C.join = null; toast('Asked to join: the creator\'s wallet lets you in.');
+      }
+      C.pick = null; C.chosen = null;
+      await loadCoinjoin(); render(); reloadPools();
+    } catch (e) { use.disabled = false; toast(e.message); }
+  });
+  const rows = ok.map(c => {
+    const ch = cjChange(c.value, k.amount, k.rate) || 0, fee = c.value - k.amount - ch;
+    const note = c.value === min ? h('div', { class: 'good small' }, `★ EXACT · no change · fee ${sats(fee)}`)
+      : ch === 0 ? h('div', { class: 'warnc small' }, `no change, but ${sats(fee - (min - k.amount))} extra goes to the miners · fee ${sats(fee)}`)
+        : h('div', { class: 'faint small' }, `change ${sats(ch)} · fee ${sats(fee)}`);
+    return h('div', { class: 'pick' + (C.chosen === c.outpoint ? ' sel' : ''), onclick: () => { C.chosen = c.outpoint; render(); } },
+      h('div', { class: 'between' }, h('span', {}, sats(c.value) + ' sats' + (c.mixed ? ' · mixed' : '')), C.chosen === c.outpoint ? h('span', { class: 'good' }, '✓') : null),
+      note, h('div', { class: 'faint small' }, c.outpoint.slice(0, 10) + '…:' + c.outpoint.split(':')[1]));
+  });
+  const shortRows = short.map(c => h('div', { class: 'pick' },
+    h('div', { class: 'faint' }, sats(c.value) + ' sats'),
+    h('div', { class: 'warnc small' }, `${sats(min - c.value)} sats short of this pool's fee (${fmtRate(k.rate)} sat/vB): it fits a pool at a lower rate`)));
+  const hasExact = coins.some(c => c.value === exact);
+  return h('div', { class: 'panel' }, h('div', { class: 'label' }, k.title),
+    poolPw ? h('div', {}, h('p', { class: 'small soft' }, '🔒 Private pool: its creator shares the password with the people invited. Without it the pool refuses you.'), poolPw) : null,
+    h('p', { class: 'small soft' }, `Pick ONE confirmed coin of at least ${sats(min)} sats. Its leftover comes back to a fresh change address; the mixed output goes to another fresh address of this wallet.`),
+    ok.length ? rows : h('p', { class: 'warnc small' }, 'No confirmed coin is big enough.'),
+    shortRows,
+    hasExact ? null : h('button', { class: 'link', onclick: () => prepareExact(exact) }, `＋ PREPARE AN EXACT COIN OF ${sats(exact)} SATS`),
+    pw,
+    h('div', { class: 'btns' }, h('button', { class: 'soft', onclick: cancelPick }, 'CANCEL'), use));
+}
+
+/**
+ * The perfect coin for a pool: a payment to a fresh address of this wallet of exactly the
+ * amount plus the no-change fee, through the normal send review. Paid with unmixed coins only.
+ */
+async function prepareExact(exact) {
+  try {
+    const r = await api('coinjoin/exact', {});
+    const pool = (C.st.coins || []).filter(c => !c.inRound && !c.mixed && c.confirmations > 0).sort((a, b) => b.value - a.value);
+    const pick = new Set(); let sum = 0;
+    for (const c of pool) { if (sum >= exact + 500) break; pick.add(c.outpoint); sum += c.value; }
+    S.form = { to: r.address, amount: String(exact), rate: '', max: false, coins: pick };
+    C.pick = null; C.join = null; C.create = null; C.chosen = null;
+    S.tab = 'btc'; S.sheet = 'send'; S.draft = null; S.sent = null; S.psbt = null;
+    render(); window.scrollTo(0, 0);
+    toast(`A payment to yourself of exactly ${sats(exact)} sats: review it. It can join once it has one confirmation.`);
+  } catch (e) { toast(e.message); }
+}
+
+// ------------------------------------------------------------------ coinjoin: alerts
+
+function soundOn() { try { return localStorage.getItem('kw.cjSound') === '1'; } catch { return false; } }
+
+function notificationsPanel() {
+  const st = C.st.settings || {};
+  const token = h('input', { placeholder: st.telegram_set ? 'bot token (saved; type to replace)' : 'bot token', autocomplete: 'off' });
+  const chat = h('input', { placeholder: 'your chat id', value: st.telegram_chat || '', autocomplete: 'off' });
+  const out = h('span', { class: 'small soft' });
+  const set = (k, v) => api('coinjoin/settings', { [k]: v }).then(s => { C.st.settings = s; }).catch(e => toast(e.message));
+  return h('div', { class: 'panel' }, h('div', { class: 'label' }, '🔔 Notifications'),
+    h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: st.notify_new_pools !== false, onchange: e => set('notify_new_pools', e.target.checked) }),
+      h('span', {}, 'New public pools', h('br'), h('span', { class: 'faint small' }, 'Looked up every 5 minutes. Your own pools are always followed.'))),
+    h('p', { class: 'small soft' }, 'Telegram, with sound, through your own bot: make one with @BotFather, send it any message, and put its token and your chat id here (@userinfobot tells you your id). Every pool event arrives there.'),
+    token, chat,
+    h('div', { class: 'row' },
+      h('button', { class: 'link', onclick: () => {
+        const body = { telegram_chat: chat.value }; if (token.value) body.telegram_token = token.value;
+        api('coinjoin/settings', body).then(s => { C.st.settings = s; token.value = ''; out.textContent = 'saved'; }).catch(e => { out.textContent = e.message; });
+      } }, 'SAVE'),
+      h('button', { class: 'link', onclick: () => { out.textContent = 'sending…'; api('coinjoin/telegram/test', {}).then(() => { out.textContent = 'sent ✓'; }).catch(e => { out.textContent = e.message; }); } }, 'SEND A TEST'),
+      out),
+    h('label', { class: 'check mt' }, h('input', { type: 'checkbox', checked: soundOn(), onchange: e => {
+      try { localStorage.setItem('kw.cjSound', e.target.checked ? '1' : '0'); } catch {}
+      if (e.target.checked) { chime(); if (window.Notification && Notification.permission === 'default') Notification.requestPermission(); }
+    } }), h('span', {}, 'Sound and a notification in this browser', h('br'), h('span', { class: 'faint small' }, 'On every pool event, while this page is open.'))));
+}
+
+function autoSignPanel() {
+  const st = C.st.settings || {};
+  return h('div', { class: 'panel' }, h('div', { class: 'label' }, 'Sign on its own'),
+    h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: !!st.auto_sign, onchange: e => api('coinjoin/settings', { auto_sign: e.target.checked }).then(s => { C.st.settings = s; }).catch(er => toast(er.message)) }),
+      h('span', {}, 'Accept close requests and sign by itself')),
+    h('p', { class: 'small faint' }, 'So a round does not wait for you. It signs only when the final transaction checks out (your mixed output, your change and your share of the fee), and only while this wallet is unlocked on the server; otherwise it does not sign and tells you why.'),
+    st.auto_sign && !C.st.unlockedForAutoSign ? h('p', { class: 'warnc small' }, 'Locked: unlock it to let it sign.') : null,
+    h('button', { class: 'link faint', onclick: () => api('coinjoin/enable', { on: false }).then(r => { C.st = r; C.pools = null; S.tab = 'btc'; render(); }).catch(e => toast(e.message)) }, 'turn coinjoin off'));
+}
+
+function howPanel() {
+  return h('div', { class: 'panel' }, h('div', { class: 'label' }, 'How a round goes'),
+    h('p', { class: 'small soft' }, `1. Someone opens a pool with an amount. 2. People join, each proving they own a real coin (one seat per coin, which stops one person from filling the pool alone). 3. With two or more in, anyone can ask to close: the others accept or refuse; whoever does not answer in ${C.st.limits.voteMinutes} minutes is left out. 4. Each wallet posts its mixed output with no name on it, after a random wait. 5. Every wallet builds the same transaction, checks its own output and change, and you sign with your password. 6. Once all have signed it goes out — signed so it is valid only on this chain, never on the spamchain. This server keeps the round going while the page is closed.`),
+    h('p', { class: 'faint small' }, 'Relay: ' + C.st.relay));
+}
+
+function chime() {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    [880, 1320].forEach((f, i) => {
+      const o = ctx.createOscillator(), g = ctx.createGain(), t = ctx.currentTime + i * 0.18;
+      o.frequency.value = f; o.connect(g); g.connect(ctx.destination);
+      g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(0.25, t + 0.02); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.3);
+      o.start(t); o.stop(t + 0.32);
+    });
+  } catch {}
+}
+
+let lastEventAt = null;
+async function pollEvents() {
+  if (!S.me || !S.me.unlocked || !C.st || !C.st.enabled) return;
+  try {
+    const evs = await api('coinjoin/events');
+    const newest = evs.length ? evs[0].at : 0;
+    if (lastEventAt === null) { lastEventAt = newest; return; } // what was there before this page opened
+    const fresh = evs.filter(e => e.at > lastEventAt);
+    lastEventAt = Math.max(lastEventAt, newest);
+    if (!fresh.length) return;
+    if (S.tab === 'coinjoin') { await loadCoinjoin().catch(() => {}); if (!busy()) render(); }
+    if (!soundOn()) return;
+    chime();
+    if (window.Notification && Notification.permission === 'granted')
+      fresh.slice(0, 3).forEach(e => new Notification(e.title, { body: e.text, tag: e.at + e.title }));
+  } catch {}
 }
 
 boot().catch(e => { $app.replaceChildren(h('div', { class: 'panel bad' }, e.message)); });
