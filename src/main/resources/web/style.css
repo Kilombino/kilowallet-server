@@ -3,7 +3,7 @@
   --faint:#6C5C86; --purple:#B96BFF; --orange:#F7931A; --good:#34D399; --warn:#FFC53D; --bad:#FF5D5D; }
 * { box-sizing:border-box; }
 html, body { margin:0; background:var(--ink); color:var(--text); font-family:ui-monospace,"SFMono-Regular",Menlo,Consolas,"Liberation Mono",monospace; font-size:13px; }
-main { max-width:520px; margin:0 auto; padding:16px 14px calc(40px + env(safe-area-inset-bottom)); }
+main { max-width:520px; margin:0 auto; padding:calc(16px + env(safe-area-inset-top)) 14px calc(40px + env(safe-area-inset-bottom)); }
 h1 { font-size:18px; color:var(--purple); margin:4px 0 10px; }
 .panel { background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:16px; margin:12px 0; }
 .panel.warn { border-color:rgba(255,197,61,.35); } .panel.bad { border-color:rgba(255,93,93,.4); }
