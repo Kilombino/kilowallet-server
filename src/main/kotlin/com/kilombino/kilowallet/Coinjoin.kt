@@ -221,7 +221,8 @@ class Coinjoin(private val dir: File, private val rpc: Rpc, private val walletPr
 
     // ------------------------------------------------------------------ events
 
-    private fun emit(title: String, text: String, pool: String?) {
+    /** Records an event (coinjoin, Ark): the web page, Telegram and StartOS notifications get it. */
+    fun emit(title: String, text: String, pool: String?) {
         val e = Event(System.currentTimeMillis(), title, text, pool)
         Thread { telegram("$title\n$text") }.start()
         events.add(0, e); while (events.size > 200) events.removeAt(events.size - 1)

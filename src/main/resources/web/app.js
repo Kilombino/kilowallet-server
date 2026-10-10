@@ -130,9 +130,10 @@ function mainView() {
       h('button', { class: 'link', onclick: () => { S.showSettings = !S.showSettings; render(); } }, S.showSettings ? 'close' : 'settings'),
       h('button', { class: 'link faint', onclick: () => api('lock', {}).then(() => { S.me.unlocked = false; S.w = null; render(); }) }, 'lock')));
   if (S.newWords) return h('div', {}, top, newWordsPanel());
-  const tabs = h('div', { class: 'tabs mt' }, [['btc', 'BTC'], ['coinjoin', 'COINJOIN']].map(([k, label]) =>
+  const tabs = h('div', { class: 'tabs mt' }, [['btc', 'BTC'], ['ark', 'ARK'], ['coinjoin', 'COINJOIN']].map(([k, label]) =>
     h('button', { class: S.tab === k ? 'on' : '', onclick: () => openTab(k) }, label)));
   if (S.tab === 'coinjoin' && !w.error && !w.importing) return h('div', {}, top, tabs, S.showSettings ? settingsPanel() : null, coinjoinView());
+  if (S.tab === 'ark') return h('div', {}, top, tabs, S.showSettings && !w.error ? settingsPanel() : null, arkView());
   if (w.error) return h('div', {}, top, h('div', { class: 'panel bad' }, h('div', { class: 'label' }, 'Node'), h('p', {}, w.error)));
   if (w.importing) return h('div', {}, top, h('div', { class: 'panel' }, h('div', { class: 'label' }, 'Reading your history'),
     h('p', { class: 'soft' }, 'The node is looking through the chain for this wallet\'s coins and movements. It can take from a minute to a while; this page updates by itself.')));
@@ -400,7 +401,7 @@ const cjOpen = () => C.st && C.st.enabled && !C.st.blocker;
 function busy() {
   const a = document.activeElement;
   if (a && a !== document.body && ['INPUT', 'TEXTAREA', 'SELECT'].includes(a.tagName)) return true;
-  return !!(S.sheet || C.create || C.join || document.querySelector('.modal-bg'));
+  return !!(S.sheet || C.create || C.join || K.sheet || document.querySelector('.modal-bg'));
 }
 
 async function loadCoinjoin() { C.st = await api('coinjoin'); }
@@ -417,6 +418,7 @@ async function reloadPools() {
 
 async function openTab(k) {
   S.tab = k; render();
+  if (k === 'ark') { await loadArk().catch(e => toast(e.message)); render(); }
   if (k === 'coinjoin') {
     await loadCoinjoin().catch(e => toast(e.message));
     render();

@@ -26,7 +26,9 @@ import java.util.concurrent.Executors
  * again (the app's fingerprint). A hot wallet's words stay encrypted on disk ([Vault]) and in
  * memory only while unlocked.
  */
-class Web(private val dir: File, private val rpc: Rpc, port: Int) {
+class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc = ArkRpc(null, null, null, null)) {
+    /** How the Ark engine reaches the node (the same RPC as the wallet's). */
+    data class ArkRpc(val url: String?, val user: String?, val pass: String?, val cookie: String?)
     private val vault = Vault(dir)
     private val cfgFile = File(dir, "config.json")
     @Volatile private var secret: Vault.Secret? = null
@@ -44,6 +46,8 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int) {
     @Volatile private var pools: List<Protocol.Terms> = emptyList()
     /** Mixed-coin warnings of the open reviews, by draft id. */
     private val mixWarnings = ConcurrentHashMap<String, String>()
+    /** Ark (the app's ARK tab): the engine, run with this wallet's words. */
+    val ark = ArkEngine(dir, arkRpc.url, arkRpc.user, arkRpc.pass, arkRpc.cookie, coinjoin) { runCatching { rpc.height() }.getOrNull() }
 
     init {
         coinjoin.secretProvider = { secret }
@@ -51,6 +55,8 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int) {
         server.executor = Executors.newFixedThreadPool(8)
         server.createContext("/") { ex -> runCatching { route(ex) }.onFailure { e -> runCatching { reply(ex, 400, err(e.message ?: "error")) } } }
         openWallet()
+        ark.startTimers()
+        Runtime.getRuntime().addShutdownHook(Thread { runCatching { ark.shutdown() } })
     }
 
     fun start() {
@@ -236,14 +242,174 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int) {
                 recheck(b)
                 require(coinjoin.live().isEmpty()) { "A coin of this wallet is in a coinjoin round: leave the pool first." }
                 coinjoin.clear()
-                saveCfg { it.remove("accountKey"); it.remove("mode"); it.remove("type") }
+                // The Ark wallet goes too, but its folder is only set aside: it may still hold coins.
+                ark.forget()
+                saveCfg { it.remove("accountKey"); it.remove("mode"); it.remove("type"); it.remove("createdHeight") }
                 File(dir, "vault.json").delete()
                 wallet = null; secret = null; token = null
                 reply(ex, 200, ok())
             }
-            else -> if (p.startsWith("/api/coinjoin")) coinjoinRoute(ex, p, b, w) else reply(ex, 404, err("not found"))
+            else -> when {
+                p.startsWith("/api/coinjoin") -> coinjoinRoute(ex, p, b, w)
+                p.startsWith("/api/ark") -> arkRoute(ex, p, b)
+                else -> reply(ex, 404, err("not found"))
+            }
         }
     }
+
+    // ------------------------------------------------------------------ ark
+
+    private fun strs(a: JSONArray?): List<String> = if (a == null) emptyList() else (0 until a.length()).map { a.getString(it) }
+
+    private fun arkBlocker(): String? = if (mode() != "hot")
+        "Ark needs a wallet that can sign here: it runs with this wallet's words, and a watch-only wallet has none." else null
+
+    private fun arkJson(): JSONObject {
+        val a = ark
+        val o = JSONObject().put("enabled", a.enabled).put("activating", a.activating).put("running", a.running)
+            .put("hasWords", a.hasWords).put("error", a.lastError ?: JSONObject.NULL).put("chain", a.chain)
+            .put("blocker", arkBlocker() ?: JSONObject.NULL).put("server", ArkEngine.SERVER).put("esplora", ArkEngine.ESPLORA)
+            .put("limits", JSONObject().put("lifetime", ArkEngine.VTXO_LIFETIME_BLOCKS).put("minBoard", ArkEngine.MIN_BOARD_SAT)
+                .put("boardConfs", ArkEngine.BOARD_CONFIRMATIONS).put("maxVtxo", ArkEngine.MAX_VTXO_SAT)
+                .put("maxLightning", ArkEngine.MAX_LIGHTNING_SAT).put("minOutput", ArkEngine.MIN_OUTPUT_SAT)
+                .put("warnBlocks", ArkEngine.EXPIRY_WARN_BLOCKS))
+        if (!a.enabled && !a.activating) { o.put("nodeProblem", a.nodeProblem(rpc) ?: JSONObject.NULL); return o }
+        if (!a.running) {
+            val known = a.state().optInt("nearest_expiry_height", 0)
+            val tip = runCatching { rpc.height() }.getOrNull()
+            if (known > 0 && tip != null) o.put("expiry", known - tip).put("expiryStale", true)
+            return o
+        }
+        val b = runCatching { a.balance() }.getOrElse { return o.put("error", it.message) }
+        o.put("balance", JSONObject().put("spendable", b.spendable).put("pendingBoard", b.pendingBoard).put("pendingRound", b.pendingRound)
+            .put("needsRefresh", b.needsRefresh).put("pendingExit", b.pendingExit).put("onchainConfirmed", b.onchainConfirmed)
+            .put("onchainPending", b.onchainPending).put("lightningPending", b.lightningPending).put("refused", b.refused))
+        a.blocksToNearestExpiry()?.let { o.put("expiry", it) }
+        val arkTip = a.tip(); val nodeTip = runCatching { rpc.height() }.getOrNull()
+        o.put("tip", arkTip ?: JSONObject.NULL).put("nodeTip", nodeTip ?: JSONObject.NULL)
+        // With Esplora as its chain source the engine could be shown another chain than the node's.
+        if (arkTip != null && nodeTip != null && kotlin.math.abs(arkTip - nodeTip) > 3) o.put("tipMismatch",
+            "The Ark engine's chain source (block $arkTip) and your node (block $nodeTip) disagree. One of them is behind or not telling the whole story: wait before moving Ark funds, and check your node.")
+        o.put("activity", JSONArray(runCatching { a.activity() }.getOrDefault(emptyList()).take(40).map { it.json() }))
+        o.put("exits", JSONArray(a.exits().let { list -> val lost = if (list.isEmpty()) emptySet() else a.lostExits()
+            list.map { e -> JSONObject().put("vtxo", e.vtxo).put("type", e.type).put("claimableHeight", e.claimableHeight ?: JSONObject.NULL)
+                .put("tip", e.tip ?: JSONObject.NULL).put("lost", e.vtxo in lost) } }))
+        return o
+    }
+
+    private fun estimateJson(e: ArkEngine.Estimate?) = e?.json() ?: err("Could not estimate the cost. Check the destination and the amount.")
+
+    private fun arkRoute(ex: HttpExchange, p: String, b: JSONObject) {
+        val a = ark
+        if (p == "/api/ark") return reply(ex, 200, arkJson())
+        arkBlocker()?.let { error(it) }
+        if (p == "/api/ark/activate") {
+            require(b.optBoolean("accept")) { "Read the warnings and tick the box first." }
+            val s = recheck(b)
+            val useNode = b.optString("chain", "node") == "node"
+            if (useNode) a.nodeProblem(rpc)?.let { error(it) }
+            val tip = runCatching { rpc.height() }.getOrNull() ?: error("The node did not answer.")
+            val created = cfg().optInt("createdHeight", 0)
+            val birthday = minOf(tip, if (created > 0) created else ArkEngine.ARK_EPOCH_HEIGHT)
+            // Creating can take a while (the deposit's past is looked up): it goes on in the background.
+            Thread { runCatching { a.activate(s, useNode, birthday) }.onFailure { System.err.println("Ark activation failed: ${it.message}") } }.start()
+            return reply(ex, 200, ok())
+        }
+        require(a.enabled) { "Activate Ark first." }
+        val to = b.optString("to").trim()
+        val amount = b.optLong("amount", 0).takeIf { it > 0 }
+        val coins = strs(b.optJSONArray("coins"))
+        when (p) {
+            "/api/ark/sync" -> { a.syncOnchain(); reply(ex, 200, arkJson()) }
+            "/api/ark/address" -> reply(ex, 200, JSONObject().put("address", if (b.optString("kind") == "deposit") a.onchainAddress() else a.arkAddress()))
+            "/api/ark/invoice" -> reply(ex, 200, JSONObject().put("invoice", a.lightningInvoice(amount ?: error("Type the amount in sats first."))))
+            "/api/ark/invoice/state" -> reply(ex, 200, JSONObject().put("state", a.lightningReceiveState(b.getString("invoice")) ?: JSONObject.NULL))
+            "/api/ark/offer" -> reply(ex, 200, JSONObject().put("offer", a.reusableOffer("Kilowallet", amount)))
+            "/api/ark/offer/disable" -> { a.disableOffer(); reply(ex, 200, ok()) }
+            "/api/ark/fees" -> reply(ex, 200, a.onchainFeeRates()?.let { JSONObject().put("fast", it.fast).put("regular", it.regular).put("slow", it.slow) } ?: JSONObject())
+            "/api/ark/coins" -> reply(ex, 200, JSONArray((if (b.optBoolean("deposit")) a.depositCoins() else a.arkCoins()).map { c ->
+                JSONObject().put("id", c.id).put("amount", c.amount).put("note", c.note).put("refused", c.id in a.rejected()) }))
+            "/api/ark/estimate" -> {
+                val fromDeposit = b.optBoolean("fromDeposit")
+                val e = when (b.optString("kind")) {
+                    "lnreceive" -> a.estimateLightningReceive(amount ?: error("Type the amount in sats first."))
+                    "board" -> {
+                        val rate = b.optDouble("rate", Double.NaN).takeIf { !it.isNaN() }
+                        val avail = a.balance().onchainConfirmed
+                        val netFee = rate?.let { runCatching { a.estimateBoardNetworkFee(it, amount == null) }.getOrNull() }
+                        val target = amount ?: (avail - (netFee ?: 0))
+                        if (target < ArkEngine.MIN_BOARD_SAT) ArkEngine.Estimate(0, 0, 0, false, "", "Moving into Ark needs at least ${ArkEngine.MIN_BOARD_SAT} sats confirmed in the deposit.")
+                        else feeQueryBoard(a, target)?.let { it.copy(note = it.note + (netFee?.let { f -> " Plus the network fee of the move: about $f sats, paid from the deposit." } ?: "")) }
+                    }
+                    "renew" -> if (coins.isEmpty()) a.estimateRenew() else a.estimateRenewCoins(coins)
+                    "exit" -> a.estimateExit()
+                    else -> when {
+                        to.isEmpty() -> error("Type where to send.")
+                        b.optBoolean("choose") && coins.isEmpty() -> ArkEngine.Estimate(0, 0, 0, false, "", "Tick the coins to spend.")
+                        b.optBoolean("choose") && fromDeposit -> a.estimateDepositCoins(to, amount, coins)
+                        b.optBoolean("choose") && to.startsWith("ark1", true) ->
+                            if (amount == null) ArkEngine.Estimate(0, 0, 0, false, "", "Enter the amount to pay.") else a.estimateArkCoins(to, amount, coins)
+                        b.optBoolean("choose") && to.startsWith("ln", true) -> ArkEngine.Estimate(0, 0, 0, false, "",
+                            "Choosing coins works for Ark payments and withdrawals to an XBT address. Lightning payments pick their coins themselves.")
+                        b.optBoolean("choose") && amount != null -> ArkEngine.Estimate(0, 0, 0, false, "", "Chosen Ark coins leave whole: leave the amount empty.")
+                        b.optBoolean("choose") -> a.estimateWithdrawCoins(to, coins)
+                        fromDeposit -> a.estimateDepositSend(to, amount)
+                        else -> a.estimateSend(to, amount)?.let { q ->
+                            // The engine quotes a cost without looking at the balance: say so before a review.
+                            val have = runCatching { a.balance().spendable }.getOrNull()
+                            if (q.problem == null && have != null && q.total > have) q.copy(problem = "That needs ${q.total} sats in total and you have $have spendable in Ark.") else q
+                        }
+                    }
+                }
+                reply(ex, 200, estimateJson(e))
+            }
+            "/api/ark/send" -> {
+                recheck(b)
+                val approved = b.optLong("approved", 0).takeIf { it > 0 } ?: error("Review the cost first.")
+                val fromDeposit = b.optBoolean("fromDeposit")
+                val r = when {
+                    coins.isNotEmpty() && fromDeposit -> a.sendDepositCoins(to, amount, coins)
+                    coins.isNotEmpty() && to.startsWith("ark1", true) && amount != null -> a.sendArkCoins(to, amount, approved, coins)
+                    coins.isNotEmpty() -> a.withdrawCoins(to, coins)
+                    fromDeposit -> a.sendFromDeposit(to, amount)
+                    else -> a.send(to, amount, approved)
+                }.ifBlank { "Sent." }
+                reply(ex, 200, JSONObject().put("message", r))
+            }
+            "/api/ark/board" -> {
+                recheck(b)
+                val rate = b.optDouble("rate", Double.NaN).takeIf { !it.isNaN() }
+                require(rate == null || rate in 0.1..10_000.0) { "Fee rate: 0.1 to 10 000 sat/vB." }
+                require(amount == null || amount >= ArkEngine.MIN_BOARD_SAT) { "Minimum to move into Ark: ${ArkEngine.MIN_BOARD_SAT} sats." }
+                a.board(amount, rate)
+                reply(ex, 200, JSONObject().put("message", "Moving into Ark. It becomes spendable after ${ArkEngine.BOARD_CONFIRMATIONS} confirmations."))
+            }
+            "/api/ark/renew" -> {
+                recheck(b)
+                val chosen = coins.ifEmpty { a.arkCoins().map { it.id } }
+                require(chosen.isNotEmpty()) { "You have no Ark coins to renew." }
+                reply(ex, 200, JSONObject().put("message", a.renewSkippingRejected(chosen)))
+            }
+            "/api/ark/exit/start" -> {
+                require(b.optString("confirm") == "EXIT") { "Type EXIT to confirm." }
+                recheck(b)
+                reply(ex, 200, JSONObject().put("message", "Emergency exit started: " + a.startExitAll()))
+            }
+            "/api/ark/exit/claim" -> { recheck(b); reply(ex, 200, JSONObject().put("message", a.claimExits(to))) }
+            "/api/ark/log" -> reply(ex, 200, JSONObject().put("log", a.engineLogTail() ?: ""))
+            else -> reply(ex, 404, err("not found"))
+        }
+    }
+
+    /**
+     * Moving [sats] into Ark. The server's quote leaves out what Paperclip documents: boarding costs
+     * the greater of the quote or 1 000 sats (the anchor) plus a separate 1 000-sat miner fee.
+     */
+    private fun feeQueryBoard(a: ArkEngine, sats: Long): ArkEngine.Estimate? = runCatching {
+        val r = JSONObject(a.call("GET", "/fees/board?amount_sat=$sats"))
+        val fee = maxOf(r.optLong("fee_sat"), 1_000L) + 1_000L
+        ArkEngine.Estimate(sats - fee, fee, sats, false, "Anchor and miner fee of the recovery transaction.")
+    }.getOrNull()
 
     // ------------------------------------------------------------------ coinjoin
 
@@ -471,8 +637,14 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int) {
     private fun finishHot(ex: HttpExchange, words: List<String>, passphrase: String, password: String, since: Long?, restored: Boolean) {
         vault.store(words, passphrase, password)
         val s = Vault.Secret(words, passphrase)
-        saveCfg { it.put("mode", "hot").put("type", "P2WPKH").put("accountKey", Spend.accountKey(s, ScriptType.P2WPKH)) }
+        val created = if (restored) null else runCatching { rpc.height() }.getOrNull()
+        saveCfg {
+            it.put("mode", "hot").put("type", "P2WPKH").put("accountKey", Spend.accountKey(s, ScriptType.P2WPKH))
+            // Where a new wallet's history starts: the Ark deposit needs no older scan.
+            if (created != null) it.put("createdHeight", created) else it.remove("createdHeight")
+        }
         secret = s
+        ark.unlocked(s)
         openWallet(since, restored)
         newSession(ex)
         reply(ex, 200, JSONObject().put("ok", true).apply { if (!restored) put("words", words.joinToString(" ")) })
@@ -496,6 +668,8 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int) {
             return reply(ex, 403, err("Wrong password."))
         }
         secret = if (mode() == "hot") s else null
+        // Ark runs with the words: it starts (or goes on) once unlocked, and keeps running after a lock.
+        if (mode() == "hot") ark.unlocked(s)
         newSession(ex)
         reply(ex, 200, ok())
     }
@@ -538,5 +712,5 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int) {
         return o
     }
 
-    companion object { const val VERSION = "0.2.0-beta1" }
+    companion object { const val VERSION = "0.2.0-beta2" }
 }

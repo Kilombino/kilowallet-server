@@ -19,6 +19,12 @@ phone, that reads the chain straight from your own node — no Electrum server.
   are flagged so they are not spent together with others. Alerts through your own Telegram bot,
   a sound in the browser, StartOS notifications, and an optional sign-on-its-own. Native SegWit
   (bc1q) hot wallets only.
+- **Ark** (beta, opt-in): the app's ARK tab, through the Paperclip Ark server
+  (ark.paperclippool.xyz), with the same words as the wallet. Receive to an Ark address, a
+  Lightning invoice or a reusable BOLT12 offer, or on-chain to a deposit that you MOVE INTO ARK;
+  send to Ark, Lightning or an XBT address with the exact cost shown first; renew, coin control,
+  emergency exit; alerts (StartOS notifications and Telegram) for payments, renewals and coins
+  close to expiry. Hot wallets only.
 
 Packaged for StartOS in [kilowallet-startos](https://github.com/Kilombino/kilowallet-startos).
 
@@ -32,3 +38,16 @@ java -jar build/libs/kilowallet-server.jar
 ```
 
 The node needs its wallet feature (not `disablewallet=1`).
+
+### Ark
+
+The engine is the app's own: the Paperclip/bark wallet (Rust), as its own process
+`kilombino-arkd`, from [Kilombino/paperclip-wallet-app](https://github.com/Kilombino/paperclip-wallet-app)
+(branch `kilombino-esplora`, crate `kilombino-ark`). `scripts/build-ark.sh` builds it for amd64 and
+arm64 into `ark-bin/` (not in git), where the Dockerfile takes it; outside a container point
+`KILOWALLET_ARKD` at the binary. The server starts it on 127.0.0.1 with a random port and bearer
+token, hands it the words over a pipe (never to disk) once the wallet is unlocked, and keeps it
+running after a lock so it renews coins; after a restart it waits for the next unlock. Its data is
+`$KILOWALLET_DATA/ark` (keep it in your backups: it is what the emergency exit needs).
+Chain data comes from the node over RPC (needs `txindex=1` and a synced node), or from
+mempool.kilombino.com's Esplora API if you choose so when activating.
