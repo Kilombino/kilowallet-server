@@ -34,6 +34,16 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
     @Volatile private var secret: Vault.Secret? = null
     @Volatile private var token: String? = null
     @Volatile private var wallet: NodeWallet? = null
+    /**
+     * A hot wallet's Taproot (BIP-86) account, next to its own (BIP-84): a second watch-only wallet
+     * in the node, set up at the first unlock after 0.3.0. Its coins count in the balance, can be
+     * spent with the others and join Taproot pools.
+     */
+    @Volatile private var walletTr: NodeWallet? = null
+    private fun wallets(): List<NodeWallet> = listOfNotNull(wallet, walletTr)
+    /** The account whose coins are of [t] (null if this wallet has none of that type). */
+    private fun walletFor(t: ScriptType): NodeWallet? = wallets().firstOrNull { it.type == t }
+    private fun walletOf(u: NodeWallet.Utxo): NodeWallet = walletFor(u.type) ?: wallet!!
     @Volatile private var walletError: String? = null
     @Volatile private var importing = false
     private val drafts = ConcurrentHashMap<String, Spend.Draft>()
@@ -41,7 +51,7 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
     private val rnd = SecureRandom()
     @Volatile private var market: JSONObject? = null
     /** Coinjoin rounds of this wallet (the app's COINJOIN tab). */
-    val coinjoin = Coinjoin(dir, rpc) { wallet }
+    val coinjoin = Coinjoin(dir, rpc) { wallets() }
     /** Open pools as last listed, so a join is checked against what the user saw. */
     @Volatile private var pools: List<Protocol.Terms> = emptyList()
     /** Mixed-coin warnings of the open reviews, by draft id. */
@@ -94,6 +104,24 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
             }
         }.start()
         wallet = w
+        openTaproot()
+    }
+
+    /** The hot wallet's Taproot account, once its key is known (derived from the words at an unlock). */
+    private fun openTaproot(rescanFrom: Long? = null) {
+        if (mode() != "hot" || type() != ScriptType.P2WPKH) { walletTr = null; return }
+        val key = cfg().optString("accountKeyTr").takeIf { it.isNotEmpty() } ?: return
+        val w = NodeWallet(dir, rpc, key, ScriptType.P2TR)
+        Thread { runCatching { w.ensure(rescanFrom ?: runCatching { w.autoSince() }.getOrNull()) }
+            .onFailure { System.err.println("Taproot account: ${it.message}") } }.start()
+        walletTr = w
+    }
+
+    /** First unlock with the words after 0.3.0 (or a new wallet): work out and open the Taproot account. */
+    private fun ensureTaproot(s: Vault.Secret) {
+        if (mode() != "hot" || type() != ScriptType.P2WPKH || cfg().optString("accountKeyTr").isNotEmpty()) return
+        saveCfg { it.put("accountKeyTr", Spend.accountKey(s, ScriptType.P2TR)) }
+        openTaproot()
     }
 
     // ------------------------------------------------------------------ plumbing
@@ -170,15 +198,18 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
         when (p) {
             "/api/lock" -> { secret = null; token = null; reply(ex, 200, ok()) }
             "/api/wallet" -> reply(ex, 200, walletJson(w))
-            "/api/receive/next" -> { val (i, a) = w.next(); reply(ex, 200, JSONObject().put("index", i).put("address", a)) }
+            "/api/receive/next" -> {
+                val rw = if (b.optString("type") == "p2tr") walletTr ?: error("Unlock the wallet once to set up its Taproot addresses.") else w
+                val (i, a) = rw.next(); reply(ex, 200, JSONObject().put("index", i).put("address", a).put("type", if (rw.type == ScriptType.P2TR) "p2tr" else "p2wpkh"))
+            }
             "/api/fee" -> reply(ex, 200, JSONObject().put("suggested", rpc.feeEstimate() ?: JSONObject.NULL))
             "/api/send/prepare" -> {
                 val chosen = b.optJSONArray("coins")?.let { a -> (0 until a.length()).map { a.getString(it) }.toSet() } ?: emptySet()
                 val amount = b.optLong("amount", 0).takeIf { it > 0 && !b.optBoolean("max") }
                 review(ex, w, planSend(w, chosen, resolve(b.getString("to")), amount, b.getDouble("rate")))
             }
-            "/api/bump" -> review(ex, w, Spend.bump(w, b.getString("txid"), b.getDouble("rate"), ours(w)).also { requireUnlocked(it) })
-            "/api/cpfp" -> review(ex, w, Spend.cpfp(w, b.getString("txid"), b.getDouble("rate"), spendable(w)))
+            "/api/bump" -> review(ex, w, Spend.bump(w, b.getString("txid"), b.getDouble("rate"), ours(), oursTypes()).also { requireUnlocked(it) })
+            "/api/cpfp" -> review(ex, w, Spend.cpfp(w, b.getString("txid"), b.getDouble("rate"), allSpendable()))
             "/api/send/confirm" -> {
                 val d = drafts[b.getString("draft")] ?: error("This review is no longer open: prepare it again.")
                 require(mode() == "hot") { "A watch-only wallet signs elsewhere: export the PSBT." }
@@ -237,16 +268,16 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
                 else vault.store(listOf("watch-only"), "", b.getString("newPassword"))
                 reply(ex, 200, ok())
             }
-            "/api/rescan" -> { Thread { runCatching { w.rescan(b.optInt("from", 0)) } }.start(); reply(ex, 200, ok()) }
+            "/api/rescan" -> { Thread { wallets().forEach { x -> runCatching { x.rescan(b.optInt("from", 0)) } } }.start(); reply(ex, 200, ok()) }
             "/api/forget" -> {
                 recheck(b)
                 require(coinjoin.live().isEmpty()) { "A coin of this wallet is in a coinjoin round: leave the pool first." }
                 coinjoin.clear()
                 // The Ark wallet goes too, but its folder is only set aside: it may still hold coins.
                 ark.forget()
-                saveCfg { it.remove("accountKey"); it.remove("mode"); it.remove("type"); it.remove("createdHeight") }
+                saveCfg { it.remove("accountKey"); it.remove("accountKeyTr"); it.remove("mode"); it.remove("type"); it.remove("createdHeight") }
                 File(dir, "vault.json").delete()
-                wallet = null; secret = null; token = null
+                wallet = null; walletTr = null; secret = null; token = null
                 reply(ex, 200, ok())
             }
             else -> when {
@@ -419,12 +450,16 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
         return w.utxos().filter { it.outpoint !in locked }
     }
 
+    /** Every account's spendable coins (a hot wallet's bc1q and bc1p), biggest first. */
+    private fun allSpendable(): List<NodeWallet.Utxo> = wallets().flatMap { spendable(it) }.sortedByDescending { it.value }
+
     private fun requireUnlocked(d: Spend.Draft) {
         val locked = coinjoin.lockedOutpoints()
         require(d.inputs.none { it.outpoint in locked }) { "A coin of this send is in a coinjoin round right now: leave the pool first, or pick other coins." }
     }
 
-    private fun isMixed(w: NodeWallet, u: NodeWallet.Utxo, mixed: Set<String>) = w.script(u.branch, u.index).toHex() in mixed
+    @Suppress("UNUSED_PARAMETER")
+    private fun isMixed(w: NodeWallet, u: NodeWallet.Utxo, mixed: Set<String>) = walletOf(u).script(u.branch, u.index).toHex() in mixed
 
     /**
      * A send, with coins in a live round left out. Without coin control, unmixed coins are
@@ -433,7 +468,7 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
     private fun planSend(w: NodeWallet, chosen: Set<String>, to: String, amount: Long?, rate: Double): Spend.Draft {
         val locked = coinjoin.lockedOutpoints()
         require(chosen.none { it in locked }) { "A chosen coin is in a coinjoin round right now." }
-        val coins = spendable(w)
+        val coins = allSpendable()
         if (chosen.isEmpty() && amount != null) {
             val mixed = coinjoin.mixedScripts()
             val plain = coins.filter { !isMixed(w, it, mixed) }
@@ -458,12 +493,16 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
     /** Only a hot wallet of native SegWit coins can join (the app's rule): every input and output must look alike. */
     private fun coinjoinBlocker(): String? = when {
         mode() != "hot" -> "Coinjoin needs a wallet that can sign here: a watch-only wallet can't prove it owns a coin or sign the round."
-        type() != ScriptType.P2WPKH && type() != ScriptType.P2TR ->
+        walletFor(ScriptType.P2WPKH) == null && walletFor(ScriptType.P2TR) == null ->
             "Coinjoin needs native SegWit (bc1q) or Taproot (bc1p) addresses: every coin and output in a round must look the same, or yours would stand out."
         else -> null
     }
 
     /** The coins a create/join asks for: `coins` (a list) or the older single `coin`. */
+    /** The account a pool of [t] uses, or why there is none. */
+    private fun cjWallet(t: ScriptType): NodeWallet = walletFor(t)
+        ?: error(if (t == ScriptType.P2TR) "This wallet has no Taproot (bc1p) account yet: unlock it once to set it up." else "This wallet has no native SegWit (bc1q) coins.")
+
     private fun cjCoins(w: NodeWallet, b: JSONObject): List<NodeWallet.Utxo> {
         val ops = b.optJSONArray("coins")?.let { a -> (0 until a.length()).map { a.getString(it) } } ?: listOf(b.getString("coin"))
         require(ops.isNotEmpty() && ops.toSet().size == ops.size) { "Pick each coin once." }
@@ -523,11 +562,12 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
                 require(hours in 1..72) { "Open for 1 to 72 hours." }
                 val maxInputs = b.optInt("maxInputs", 1)
                 require(maxInputs in 1..Protocol.MAX_INPUTS) { "Coins per person: 1 to ${Protocol.MAX_INPUTS}." }
-                val us = cjCoins(w, b)
+                val pw = cjWallet(if (b.optString("script") == "p2tr") ScriptType.P2TR else ScriptType.P2WPKH)
+                val us = cjCoins(pw, b)
                 require(us.size <= maxInputs) { "At most $maxInputs coin(s) per person in this pool." }
-                require(CoinjoinTx.change(us.sumOf { it.value }, amount, rate, us.size, type()) != null) { "These coins are too small for this pool." }
+                require(CoinjoinTx.change(us.sumOf { it.value }, amount, rate, us.size, pw.type) != null) { "These coins are too small for this pool." }
                 val s = recheck(b)
-                val st = coinjoin.create(s, w, us, amount, rate, minPeers, maxPeers, hours, b.optString("poolPassword"), maxInputs)
+                val st = coinjoin.create(s, pw, us, amount, rate, minPeers, maxPeers, hours, b.optString("poolPassword"), maxInputs)
                 reply(ex, 200, JSONObject().put("pool", st.poolId))
             }
             "/api/coinjoin/join" -> {
@@ -536,10 +576,11 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
                     ?: runCatching { coinjoin.fetchPools() }.getOrNull()?.also { pools = it }?.firstOrNull { it.id == id }
                     ?: error("That pool is no longer open.")
                 require(!t.private || b.optString("poolPassword").isNotEmpty()) { "Type the pool's password first." }
-                val us = cjCoins(w, b)
+                val pw = cjWallet(t.script)
+                val us = cjCoins(pw, b)
                 require(CoinjoinTx.change(us.sumOf { it.value }, t.amount, t.feeRate, us.size, t.script) != null) { "These coins are too small for this pool." }
                 val s = recheck(b)
-                coinjoin.join(s, w, us, t, b.optString("poolPassword"))
+                coinjoin.join(s, pw, us, t, b.optString("poolPassword"))
                 reply(ex, 200, ok())
             }
             "/api/coinjoin/close" -> { coinjoin.session(b.getString("pool")).requestClose(); reply(ex, 200, ok()) }
@@ -549,7 +590,8 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
             "/api/coinjoin/remove" -> { coinjoin.remove(b.getString("pool")); reply(ex, 200, ok()) }
             // The perfect coin for a pool: a payment to a fresh address of this wallet nobody has seen.
             "/api/coinjoin/exact" -> {
-                val (i, script) = w.reserveReceive()
+                // Of the pool's type, whatever coins pay for it.
+                val (i, script) = cjWallet(if (b.optString("script") == "p2tr") ScriptType.P2TR else ScriptType.P2WPKH).reserveReceive()
                 reply(ex, 200, JSONObject().put("index", i).put("address", Spend.addressOf(script)))
             }
             else -> reply(ex, 404, err("not found"))
@@ -569,12 +611,13 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
         .put("minPeers", t.minPeers).put("maxPeers", t.maxPeers).put("expiresAt", t.expiresAt).put("private", t.private)
         .put("feeWithChange", CoinjoinTx.feeShare(t.feeRate, true, 1, t.script)).put("feeNoChange", CoinjoinTx.feeShare(t.feeRate, false, 1, t.script))
         .put("script", Protocol.scriptName(t.script)).put("maxInputs", t.maxInputs).put("version", t.version)
-        .put("joinable", t.script == type())
+        .put("joinable", walletFor(t.script) != null)
 
     private fun coinjoinJson(w: NodeWallet): JSONObject {
         val o = JSONObject().put("enabled", coinjoin.enabled).put("relay", Protocol.RELAY)
             .put("blocker", coinjoinBlocker() ?: JSONObject.NULL).put("settings", cjSettingsJson())
             .put("script", Protocol.scriptName(if (type() == ScriptType.P2TR) ScriptType.P2TR else ScriptType.P2WPKH))
+            .put("taproot", walletFor(ScriptType.P2TR) != null).put("segwit", walletFor(ScriptType.P2WPKH) != null)
             .put("maxInputs", Protocol.MAX_INPUTS)
             .put("unlockedForAutoSign", secret != null)
             .put("limits", JSONObject().put("minAmount", Protocol.MIN_AMOUNT).put("maxAmount", Protocol.MAX_AMOUNT)
@@ -583,11 +626,12 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
         o.put("mine", JSONArray(coinjoin.states().map { stateJson(it) }))
         if (coinjoin.enabled && coinjoinBlocker() == null) {
             val locked = coinjoin.lockedOutpoints(); val mixed = coinjoin.mixedScripts()
-            val us = runCatching { w.utxos() }.getOrDefault(emptyList())
+            val us = wallets().flatMap { x -> runCatching { x.utxos() }.getOrDefault(emptyList()) }.sortedByDescending { it.value }
             o.put("coins", JSONArray(us.map { u ->
                 JSONObject().put("outpoint", u.outpoint).put("value", u.value).put("confirmations", u.confirmations)
                     .put("mixed", isMixed(w, u, mixed)).put("change", u.branch == 1).put("inRound", u.outpoint in locked)
-                    .put("address", w.address(u.branch, u.index))
+                    .put("address", walletOf(u).address(u.branch, u.index))
+                    .put("type", if (u.type == ScriptType.P2TR) "p2tr" else "p2wpkh")
             }))
         }
         return o
@@ -616,9 +660,16 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
         return to.trim()
     }
 
-    private fun ours(w: NodeWallet): Map<String, Pair<Int, Int>> {
+    private fun ours(): Map<String, Pair<Int, Int>> {
         val m = HashMap<String, Pair<Int, Int>>()
-        for (b in 0..1) for (i in 0 until 400) m[w.script(b, i).toHex()] = b to i
+        for (w in wallets()) for (b in 0..1) for (i in 0 until 400) m[w.script(b, i).toHex()] = b to i
+        return m
+    }
+
+    /** The type of each of our scripts, for a replacement that spends coins of both accounts. */
+    private fun oursTypes(): Map<String, ScriptType> {
+        val m = HashMap<String, ScriptType>()
+        for (w in wallets()) for (b in 0..1) for (i in 0 until 400) m[w.script(b, i).toHex()] = w.type
         return m
     }
 
@@ -627,6 +678,7 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
         val mix = mixWarning(w, d)?.also { mixWarnings[d.id] = it }
         reply(ex, 200, JSONObject().put("draft", d.id).put("to", d.toAddress).put("amount", d.amount).put("fee", d.fee)
             .put("change", d.change).put("inputs", d.inputs.size).put("vbytes", d.vbytes)
+            .put("changeAddress", d.changeIndex?.let { Spend.addressOf(w.script(1, it)) } ?: JSONObject.NULL)
             .put("rate", d.fee / d.vbytes).put("concern", Spend.concern(d) ?: JSONObject.NULL)
             .put("replaces", d.replaces ?: JSONObject.NULL).put("replacedFee", d.replacedFee)
             .put("cpfpParent", d.cpfpParent ?: JSONObject.NULL).put("packageRate", d.packageRate)
@@ -662,6 +714,7 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
         }
         secret = s
         ark.unlocked(s)
+        saveCfg { it.put("accountKeyTr", Spend.accountKey(s, ScriptType.P2TR)) }
         openWallet(since, restored)
         newSession(ex)
         reply(ex, 200, JSONObject().put("ok", true).apply { if (!restored) put("words", words.joinToString(" ")) })
@@ -686,7 +739,7 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
         }
         secret = if (mode() == "hot") s else null
         // Ark runs with the words: it starts (or goes on) once unlocked, and keeps running after a lock.
-        if (mode() == "hot") ark.unlocked(s)
+        if (mode() == "hot") { ark.unlocked(s); runCatching { ensureTaproot(s) } }
         newSession(ex)
         reply(ex, 200, ok())
     }
@@ -702,8 +755,14 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
         val o = JSONObject().put("mode", mode()).put("type", type().name).put("node", w.name)
         walletError?.let { return o.put("error", it) }
         if (importing) return o.put("importing", true)
-        val (conf, pending) = runCatching { w.balance() }.getOrElse { return o.put("error", it.message ?: "node error") }
-        val txs = w.transactions()
+        val (conf, pending) = runCatching {
+            wallets().map { it.balance() }.fold(0L to 0L) { a, x -> (a.first + x.first) to (a.second + x.second) }
+        }.getOrElse { return o.put("error", it.message ?: "node error") }
+        // One movement per transaction: one that touches both accounts adds up what it did to each.
+        val txs = wallets().flatMap { x -> runCatching { x.transactions() }.getOrDefault(emptyList()) }
+            .groupBy { it.txid }.values.map { g ->
+                NodeWallet.Tx(g[0].txid, g.sumOf { it.net }, g.maxOf { it.confirmations }, g.maxOf { it.time }, g.mapNotNull { it.fee }.maxOrNull())
+            }.sortedWith(compareBy({ it.confirmations > 0 }, { if (it.confirmations > 0) it.confirmations.toLong() else -it.time }))
         var left = conf + pending
         val txArr = JSONArray()
         for (t in txs) {
@@ -711,16 +770,19 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
                 .put("time", t.time).put("left", left))
             left -= t.net
         }
-        val utxos = w.utxos()
+        val utxos = wallets().flatMap { it.utxos() }.sortedByDescending { it.value }
         val (ri, ra) = w.receive()
         val locked = coinjoin.lockedOutpoints(); val mixed = coinjoin.mixedScripts()
         o.put("confirmed", conf).put("pending", pending).put("transactions", txArr)
             .put("coins", JSONArray(utxos.map { u ->
                 JSONObject().put("outpoint", u.outpoint).put("value", u.value).put("confirmations", u.confirmations)
-                    .put("address", w.address(u.branch, u.index)).put("change", u.branch == 1)
+                    .put("address", walletOf(u).address(u.branch, u.index)).put("change", u.branch == 1)
+                    .put("type", if (u.type == ScriptType.P2TR) "p2tr" else "p2wpkh")
                     .put("mixed", isMixed(w, u, mixed)).put("inRound", u.outpoint in locked)
             }))
             .put("receive", JSONObject().put("index", ri).put("address", ra).put("path", "${ri}"))
+            .put("taproot", walletTr != null)
+            .apply { walletTr?.receive()?.let { (ti, ta) -> put("receiveTr", JSONObject().put("index", ti).put("address", ta)) } }
             .put("height", runCatching { rpc.height() }.getOrDefault(0))
             .put("accountKey", cfg().optString("accountKey"))
             .put("settings", settingsJson())
@@ -729,5 +791,5 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
         return o
     }
 
-    companion object { const val VERSION = "0.2.0-beta2" }
+    companion object { const val VERSION = "0.3.0" }
 }

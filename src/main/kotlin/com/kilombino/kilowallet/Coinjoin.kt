@@ -25,7 +25,7 @@ import java.util.concurrent.TimeUnit
  * Coins come from the node's watch-only wallet ([NodeWallet]); keys are derived from the
  * unlocked words only to join (the ownership proof) and to sign, and are never kept.
  */
-class Coinjoin(private val dir: File, private val rpc: Rpc, private val walletProvider: () -> NodeWallet?) {
+class Coinjoin(private val dir: File, private val rpc: Rpc, private val walletProvider: () -> List<NodeWallet>) {
     private val sessionsFile = File(dir, "coinjoin-sessions.json")
     private val settingsFile = File(dir, "coinjoin.json")
     private val sessions = ConcurrentHashMap<String, PoolSession>()
@@ -94,9 +94,9 @@ class Coinjoin(private val dir: File, private val rpc: Rpc, private val walletPr
         Thread {
             runCatching {
                 Thread.sleep(3000)
-                val w = walletProvider() ?: return@runCatching
-                txid?.let { w.noteSent(it) }
-                w.utxos()
+                val ws = walletProvider()
+                txid?.let { t -> ws.firstOrNull()?.noteSent(t) }
+                ws.forEach { it.utxos() }
             }
         }.start()
     }
@@ -246,7 +246,7 @@ class Coinjoin(private val dir: File, private val rpc: Rpc, private val walletPr
         override fun broadcast(rawHex: String): String = rpc.call("sendrawtransaction", rawHex) as String
         override fun confirmations(txid: String): Int? {
             // The round pays this wallet, so its node wallet knows it (pruned node, no txindex).
-            walletProvider()?.let { w ->
+            for (w in walletProvider()) {
                 runCatching { rpc.call("gettransaction", txid, true, wallet = w.name) as JSONObject }.getOrNull()
                     ?.optInt("confirmations", -1)?.takeIf { it >= 0 }?.let { return it }
             }

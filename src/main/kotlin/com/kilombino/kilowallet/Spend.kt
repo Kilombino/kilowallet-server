@@ -42,17 +42,22 @@ object Spend {
         var psbt: ByteArray? = null,    // watch-only: the PSBT handed out, the only one taken back
     ) {
         val id: String = java.util.UUID.randomUUID().toString()
-        val vbytes: Double get() = vsize(inputs.size, outputs.map { it.scriptPubKey }, type)
+        val vbytes: Double get() = vsize(inputs, outputs.map { it.scriptPubKey })
+        /** The wallet's own type (a watch-only wallet's PSBT); each input signs with its own [NodeWallet.Utxo.type]. */
         var type: ScriptType = ScriptType.P2WPKH
     }
 
     private fun inputVbytes(t: ScriptType) = when (t) {
-        ScriptType.P2WPKH -> 68.0; ScriptType.P2SH_P2WPKH -> 91.0; ScriptType.P2TR -> 57.5; ScriptType.P2PKH -> 148.0
+        ScriptType.P2WPKH -> 68.0; ScriptType.P2SH_P2WPKH -> 91.0; ScriptType.P2TR -> 57.75; ScriptType.P2PKH -> 148.0
     }
 
     fun vsize(nIn: Int, outs: List<ByteArray>, t: ScriptType): Double = 10.5 + inputVbytes(t) * nIn + outs.sumOf { 9.0 + it.size }
 
-    private fun fee(nIn: Int, outs: List<ByteArray>, t: ScriptType, rate: Double) = ceil(vsize(nIn, outs, t) * rate).toLong()
+    /** Each input weighs what its own type does: bc1q and bc1p coins can go out together. */
+    fun vsize(ins: List<NodeWallet.Utxo>, outs: List<ByteArray>): Double =
+        10.5 + ins.sumOf { inputVbytes(it.type) } + outs.sumOf { 9.0 + it.size }
+
+    private fun fee(ins: List<NodeWallet.Utxo>, outs: List<ByteArray>, rate: Double) = ceil(vsize(ins, outs) * rate).toLong()
 
     /**
      * Send [amount] (everything, less the fee, when null) to [to] at [rate] sat/vB from [chosen]
@@ -66,7 +71,7 @@ object Spend {
         require(pool.isNotEmpty()) { if (chosen.isEmpty()) "No coins to spend yet." else "Pick at least one coin." }
         val (changeIndex, changeScript) = w.peekChange()
         if (amount == null) {
-            val f = fee(pool.size, listOf(toScript), w.type, rate)
+            val f = fee(pool, listOf(toScript), rate)
             val send = pool.sumOf { it.value } - f
             require(send > DUST) { "These coins do not cover the fee." }
             return Draft(pool, listOf(TxBuilder.Output(toScript, send)), to.trim(), send, f, 0, null).also { it.type = w.type }
@@ -74,35 +79,36 @@ object Spend {
         require(amount > DUST) { "The amount is too small to send." }
         val picked = if (chosen.isNotEmpty()) pool else {
             val acc = mutableListOf<NodeWallet.Utxo>(); var s = 0L
-            for (u in pool) { acc += u; s += u.value; if (s >= amount + fee(acc.size, listOf(toScript, changeScript), w.type, rate)) break }
+            for (u in pool) { acc += u; s += u.value; if (s >= amount + fee(acc, listOf(toScript, changeScript), rate)) break }
             acc
         }
         val sum = picked.sumOf { it.value }
-        val fWith = fee(picked.size, listOf(toScript, changeScript), w.type, rate)
+        val fWith = fee(picked, listOf(toScript, changeScript), rate)
         val change = sum - amount - fWith
         if (change > DUST) return Draft(picked, listOf(TxBuilder.Output(toScript, amount), TxBuilder.Output(changeScript, change)),
             to.trim(), amount, fWith, change, changeIndex).also { it.type = w.type }
-        val fNo = fee(picked.size, listOf(toScript), w.type, rate)
+        val fNo = fee(picked, listOf(toScript), rate)
         require(sum - amount >= fNo) { "Not enough funds for $amount sats plus the fee." }
         return Draft(picked, listOf(TxBuilder.Output(toScript, amount)), to.trim(), amount, sum - amount, 0, null).also { it.type = w.type }
     }
 
     /** RBF: the same inputs and recipients, the extra fee taken from our change. */
-    fun bump(w: NodeWallet, txid: String, rate: Double, ours: Map<String, Pair<Int, Int>>): Draft {
+    fun bump(w: NodeWallet, txid: String, rate: Double, ours: Map<String, Pair<Int, Int>>, types: Map<String, ScriptType> = emptyMap()): Draft {
         val tx = TxParse.parse(w.rawTx(txid))
         val inputs = tx.inputs.map { i ->
             val prev = TxParse.parse(w.rawTx(i.txid)).outputs[i.vout]
-            val (b, idx) = ours[com.kilombino.pyblockwatch.crypto.Hashes.run { prev.scriptPubKey.toHex() }]
+            val h = com.kilombino.pyblockwatch.crypto.Hashes.run { prev.scriptPubKey.toHex() }
+            val (b, idx) = ours[h]
                 ?: error("This transaction spends coins that are not in this wallet: it can't be replaced from here.")
-            NodeWallet.Utxo(i.txid, i.vout, prev.value, 0, b, idx)
+            NodeWallet.Utxo(i.txid, i.vout, prev.value, 0, b, idx, types[h] ?: w.type)
         }
         val outs = tx.outputs.map { TxBuilder.Output(it.scriptPubKey, it.value) }
         val hex = { o: TxBuilder.Output -> com.kilombino.pyblockwatch.crypto.Hashes.run { o.scriptPubKey.toHex() } }
         val changeAt = outs.indices.filter { ours[hex(outs[it])]?.first == 1 }.maxByOrNull { outs[it].value }
             ?: error("This send has no change output to pay a higher fee from.")
         val oldFee = inputs.sumOf { it.value } - outs.sumOf { it.value }
-        val newFee = maxOf(fee(inputs.size, outs.map { it.scriptPubKey }, w.type, rate),
-            oldFee + fee(inputs.size, outs.map { it.scriptPubKey }, w.type, 1.0) + 1)
+        val newFee = maxOf(fee(inputs, outs.map { it.scriptPubKey }, rate),
+            oldFee + fee(inputs, outs.map { it.scriptPubKey }, 1.0) + 1)
         val change = outs[changeAt].value - (newFee - oldFee)
         require(change > DUST) { "The change (${outs[changeAt].value} sats) can't cover the new fee of $newFee sats." }
         val newOuts = outs.mapIndexed { n, o -> if (n == changeAt) o.copy(value = change) else o }
@@ -121,7 +127,7 @@ object Spend {
         val ours = utxos.filter { it.txid == txid }
         require(ours.isNotEmpty()) { "This transaction has no unspent output of this wallet to speed it up with." }
         val (changeIndex, to) = w.peekChange()
-        val childVsize = vsize(ours.size, listOf(to), w.type)
+        val childVsize = vsize(ours, listOf(to))
         val need = ceil(rate.coerceIn(1.0, 1000.0) * (parentVsize + childVsize)).toLong() - parentFee
         require(need > childVsize) {
             "It already pays ${"%.1f".format(java.util.Locale.ROOT, parentFee.toDouble() / parentVsize)} sat/vB: choose a higher rate than that."
@@ -154,8 +160,9 @@ object Spend {
     fun sign(secret: Vault.Secret, d: Draft): TxBuilder.Signed {
         val m = master(secret)
         val inputs = d.inputs.map { u ->
-            val k = Bip32Priv.derivePath(m, "m/${purpose(d.type)}'/0'/0'/${u.branch}/${u.index}")
-            TxBuilder.Input(u.txid, u.vout, u.value, k.key, k.publicKey(), 0xfffffffdL, d.type)
+            // Each coin with its own account's key: BIP-84, or BIP-86 for a Taproot one.
+            val k = Bip32Priv.derivePath(m, "m/${purpose(u.type)}'/0'/0'/${u.branch}/${u.index}")
+            TxBuilder.Input(u.txid, u.vout, u.value, k.key, k.publicKey(), 0xfffffffdL, u.type)
         }
         return TxBuilder.build(inputs, d.outputs, unified = true, grindLowR = true)
     }

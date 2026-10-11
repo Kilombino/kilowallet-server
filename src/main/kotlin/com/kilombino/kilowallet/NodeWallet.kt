@@ -28,7 +28,9 @@ class NodeWallet(private val dir: File, private val rpc: Rpc, accountKey: String
     private val stateFile = File(dir, "addresses.json")
 
     data class Tx(val txid: String, val net: Long, val confirmations: Int, val time: Long, val fee: Long?)
-    data class Utxo(val txid: String, val vout: Int, val value: Long, val confirmations: Int, val branch: Int, val index: Int) {
+    data class Utxo(val txid: String, val vout: Int, val value: Long, val confirmations: Int, val branch: Int, val index: Int,
+                    /** The account it belongs to: the wallet's own type, or Taproot for a hot wallet's second account. */
+                    val type: ScriptType = ScriptType.P2WPKH) {
         val outpoint get() = "$txid:$vout"
     }
 
@@ -125,7 +127,7 @@ class NodeWallet(private val dir: File, private val rpc: Rpc, accountKey: String
             val o = r.getJSONObject(k)
             val (b, i) = by[o.getString("scriptPubKey")] ?: return@mapNotNull null
             bump(b, i + 1)
-            Utxo(o.getString("txid"), o.getInt("vout"), sats(o.getDouble("amount")), o.getInt("confirmations"), b, i)
+            Utxo(o.getString("txid"), o.getInt("vout"), sats(o.getDouble("amount")), o.getInt("confirmations"), b, i, type)
         }.sortedByDescending { it.value }
     }
 

@@ -167,15 +167,22 @@ function newWordsPanel() {
 }
 
 function receivePanel() {
-  const r = S.w.receive;
+  // A hot wallet has a Taproot account too: receive on either.
+  const tr = S.recvTr && S.w.receiveTr;
+  const r = tr ? S.w.receiveTr : S.w.receive;
+  const pickType = S.w.taproot ? h('div', { class: 'tabs' },
+    h('button', { class: tr ? 'soft' : 'primary', onclick: () => { S.recvTr = false; render(); } }, 'bc1q · SegWit'),
+    h('button', { class: tr ? 'primary' : 'soft', onclick: () => { S.recvTr = true; render(); } }, 'bc1p · Taproot')) : null;
   return h('div', { class: 'panel' },
     h('div', { class: 'between' }, h('div', { class: 'label' }, 'Receive'), h('button', { class: 'link faint', onclick: () => { S.sheet = null; render(); } }, 'close')),
+    pickType,
     qr('bitcoin:' + r.address), h('div', { class: 'mono center' }, r.address),
-    h('div', { class: 'faint small center' }, `unused · m/…/0/${r.index}`),
+    h('div', { class: 'faint small center' }, `unused · m/${tr ? 86 : 84}'/…/0/${r.index}`),
     h('div', { class: 'btns' },
       h('button', { class: 'soft', onclick: () => copy(r.address) }, 'COPY'),
-      h('button', { class: 'soft', onclick: () => api('receive/next', {}).then(n => { S.w.receive = n; render(); }).catch(e => toast(e.message)) }, 'NEXT ADDRESS')));
+      h('button', { class: 'soft', onclick: () => api('receive/next', { type: tr ? 'p2tr' : 'p2wpkh' }).then(n => { if (tr) S.w.receiveTr = n; else S.w.receive = n; render(); }).catch(e => toast(e.message)) }, 'NEXT ADDRESS')));
 }
+const typeTag = c => (S.w && S.w.taproot) ? (c.type === 'p2tr' ? ' · bc1p' : ' · bc1q') : '';
 
 // ------------------------------------------------------------------ send
 
@@ -199,7 +206,7 @@ function sendForm() {
   const scan = ('BarcodeDetector' in window) ? h('button', { class: 'link', onclick: () => scanQr(v => { f.to = v.replace(/^bitcoin:/i, '').split('?')[0]; to.value = f.to; }) }, '📷 SCAN') : null;
   const coinBox = h('div', {}, (S.w.coins || []).map(c => h('label', { class: 'check small' + (c.inRound ? ' faint' : '') },
     h('input', { type: 'checkbox', disabled: c.inRound, checked: f.coins.has(c.outpoint) && !c.inRound, onchange: e => { e.target.checked ? f.coins.add(c.outpoint) : f.coins.delete(c.outpoint); } }),
-    h('span', { class: 'grow' }, `${street(sats(c.value) + ' sats')} · ${c.confirmations} conf${c.change ? ' · change' : ''}`,
+    h('span', { class: 'grow' }, `${street(sats(c.value) + ' sats')}${typeTag(c)} · ${c.confirmations} conf${c.change ? ' · change' : ''} · ${short(c.address)}`,
       c.mixed ? h('span', { class: 'good' }, ' · mixed') : null, c.inRound ? h('span', { class: 'warnc' }, ' · in a coinjoin round') : null))));
   const coinNote = (S.w.coins || []).some(c => c.mixed) ? h('p', { class: 'faint small' }, 'Never spend a mixed coin together with other coins: that links them again.') : null;
   const cc = h('details', { open: f.coins.size > 0 }, h('summary', { class: 'soft small' }, 'Coin control'), coinNote, coinBox);
@@ -231,6 +238,7 @@ function reviewView(d) {
     h('div', { class: 'between' }, h('span', { class: 'soft' }, 'Fee'), h('span', {}, (d.replaces ? sats(d.replacedFee) + ' → ' : '') + sats(d.fee) + ' sats · ' +
       (d.cpfpParent ? d.packageRate.toFixed(1) + ' sat/vB both together' : d.rate.toFixed(1) + ' sat/vB'))),
     h('div', { class: 'between' }, h('span', { class: 'soft' }, 'Change'), h('span', {}, d.change && !d.cpfpParent ? sats(d.change) + ' sats' : '—')),
+    d.changeAddress && d.change && !d.cpfpParent ? h('div', { class: 'faint small', style: 'text-align:right' }, 'back to your address ' + short(d.changeAddress)) : null,
     h('div', { class: 'between' }, h('span', { class: 'soft' }, 'Inputs'), h('span', {}, d.inputs)),
     h('p', { class: 'faint small' }, 'Signed with the unified sighash: valid only on BTC, it can\'t be replayed on the spamchain.'),
     d.concern ? h('div', {}, h('p', { class: 'badc small' }, '⚠ ' + d.concern + ' Check it before signing: a fee can\'t be taken back.'),
@@ -302,7 +310,7 @@ function coinsPanel() {
   const cs = (S.w && S.w.coins) || [];
   if (!cs.length) return null;
   return h('details', { class: 'panel' }, h('summary', { class: 'label' }, `Coins (${cs.length})`),
-    cs.map(c => h('div', { class: 'tx' }, h('div', { class: 'between' }, h('span', {}, street(sats(c.value) + ' sats')), h('span', { class: 'faint small' }, `${c.confirmations} conf`)),
+    cs.map(c => h('div', { class: 'tx' }, h('div', { class: 'between' }, h('span', {}, street(sats(c.value) + ' sats') + typeTag(c)), h('span', { class: 'faint small' }, `${c.confirmations} conf`)),
       h('div', { class: 'faint small mono' }, c.address + (c.change ? ' · change' : ''),
         c.mixed ? h('span', { class: 'good' }, ' · mixed') : null, c.inRound ? h('span', { class: 'warnc' }, ' · in a coinjoin round') : null))));
 }
@@ -383,7 +391,8 @@ async function scanQr(done) {
 const C = { st: null, pools: null, loading: false, msg: null, create: null, join: null, pick: null, chosen: [] };
 // The pool's address type is this wallet's (C.st.script): P2WPKH input 68 vB / output 31; Taproot 57.75 / 43.
 const inVb = t => (t === 'p2tr' ? 57.75 : 68), outVb = t => (t === 'p2tr' ? 43 : 31);
-const cjType = () => (C.st && C.st.script) || 'p2wpkh';
+// The pool being opened or joined decides the type (a hot wallet has bc1q and bc1p accounts).
+const cjType = () => (C.pick && C.pick.script) || (C.create && C.create.script) || (C.st && C.st.script) || 'p2wpkh';
 const kindName = t => (t === 'p2tr' ? 'Taproot (bc1p)' : 'native SegWit (bc1q)');
 const feeShare = (rate, withChange, n = 1, t = cjType()) => Math.ceil(rate * (inVb(t) * n + outVb(t) + (withChange ? outVb(t) : 0) + 10.5 / 2));
 const minCoin = (amount, rate) => amount + feeShare(rate, false);
@@ -454,7 +463,7 @@ function coinjoinView() {
   if (C.pick) { parts.push(coinPicker()); return h('div', {}, parts); }
   if (C.create) { parts.push(createForm()); return h('div', {}, parts); }
   parts.push(h('div', { class: 'btns' }, h('button', { class: 'primary', onclick: () => {
-    C.create = { amount: '100000', rate: '1', min: '2', max: '5', hours: '6', inputs: '5', password: '' }; render();
+    C.create = { amount: '100000', rate: '1', min: '2', max: '5', hours: '6', inputs: '5', password: '', script: C.st.segwit === false ? 'p2tr' : 'p2wpkh' }; render();
   } }, '＋  OPEN A POOL')));
   parts.push(openPools(mine), notificationsPanel(), autoSignPanel(), howPanel());
   return h('div', {}, parts);
@@ -558,7 +567,7 @@ function openPools(mine) {
           h('div', { class: 'soft small' }, `${t.peers}/${t.maxPeers} people (min ${t.minPeers}) · ${t.feeRate} sat/vB · closes in ${left(t.expiresAt)}`),
           h('div', { class: 'faint small' }, `joining costs you ${sats(t.feeWithChange)} sats in fees with one coin (${sats(t.feeNoChange)} with a coin of exactly ${sats(t.amount + t.feeNoChange)})`),
           t.joinable ? null : h('div', { class: 'warnc small' }, `This wallet's coins are ${kindName(cjType())}: it can't join this pool.`)),
-        h('button', { class: 'soft', disabled: !t.joinable, onclick: () => { C.join = { pool: t, password: '' }; C.pick = { title: 'Join · ' + sats(t.amount) + ' sats', amount: t.amount, rate: t.feeRate, maxInputs: t.maxInputs }; C.chosen = []; render(); } }, 'JOIN'))))
+        h('button', { class: 'soft', disabled: !t.joinable, onclick: () => { C.join = { pool: t, password: '' }; C.pick = { title: 'Join · ' + sats(t.amount) + ' sats', amount: t.amount, rate: t.feeRate, maxInputs: t.maxInputs, script: t.script }; C.chosen = []; render(); } }, 'JOIN'))))
         : h('p', { class: 'faint small' }, 'No open pools right now. Open one and others will be notified.'));
 }
 
@@ -597,10 +606,14 @@ function createForm() {
     h('input', { value: f[k], inputmode: mode, oninput: e => { f[k] = e.target.value; update(); } })];
   next.addEventListener('click', () => {
     if (createError(f)) return;
-    C.pick = { title: 'Your coins for the pool', amount: Number(f.amount.replace(/\D/g, '')), rate: Number(f.rate.replace(',', '.')), maxInputs: Number(f.inputs) }; C.chosen = []; render();
+    C.pick = { title: 'Your coins for the pool', amount: Number(f.amount.replace(/\D/g, '')), rate: Number(f.rate.replace(',', '.')), maxInputs: Number(f.inputs), script: f.script }; C.chosen = []; render();
   });
   update();
   return h('div', { class: 'panel' }, h('div', { class: 'label' }, 'Open a pool'),
+    (C.st.taproot && C.st.segwit) ? h('div', {}, h('div', { class: 'soft small mt' }, "address type: every coin, mixed output and change of the pool is of it"),
+      h('select', { onchange: e => { f.script = e.target.value; update(); } },
+        h('option', { value: 'p2wpkh', selected: f.script !== 'p2tr' }, 'Native SegWit (bc1q)'),
+        h('option', { value: 'p2tr', selected: f.script === 'p2tr' }, 'Taproot (bc1p)'))) : null,
     field('amount per person (sats)', 'amount', 'numeric'), btc,
     field('fee rate (sat/vB)', 'rate', 'decimal'),
     field(`fewest people to close (${L.minPeers}–${L.maxPeers - 1})`, 'min', 'numeric'),
@@ -620,7 +633,7 @@ function cancelPick() {
 
 function coinPicker() {
   const k = C.pick, maxIn = k.maxInputs || 1, exact = k.amount + feeShare(k.rate, false);
-  const coins = (C.st.coins || []).filter(c => !c.inRound && c.confirmations > 0);
+  const coins = (C.st.coins || []).filter(c => !c.inRound && c.confirmations > 0 && (c.type || 'p2wpkh') === cjType());
   const ok = coins.filter(c => maxIn > 1 || c.value >= exact).sort((a, b) => (a.value === exact ? 0 : 1) - (b.value === exact ? 0 : 1) || b.value - a.value);
   const short = maxIn > 1 ? [] : coins.filter(c => c.value >= k.amount && c.value < exact).sort((a, b) => b.value - a.value);
   const pw = h('input', { type: 'password', placeholder: 'password, to put your coins in', autocomplete: 'current-password' });
@@ -633,7 +646,7 @@ function coinPicker() {
     try {
       if (C.create) {
         const f = C.create;
-        await api('coinjoin/create', { coins: C.chosen, maxInputs: maxIn, amount: k.amount, feeRate: k.rate, minPeers: Number(f.min), maxPeers: Number(f.max),
+        await api('coinjoin/create', { coins: C.chosen, script: cjType(), maxInputs: maxIn, amount: k.amount, feeRate: k.rate, minPeers: Number(f.min), maxPeers: Number(f.max),
           hours: Number(f.hours), poolPassword: f.password, password: pw.value });
         C.create = null; toast('Pool opened: others are told about it.');
       } else {
@@ -652,7 +665,7 @@ function coinPicker() {
       m = modal(h('div', { class: 'label' }, 'Make the perfect coin?'),
         h('p', { class: 'small soft' }, `With ${C.chosen.length > 1 ? 'these ' + C.chosen.length + ' coins' : 'this coin'} you get ${sats(ch)} sats of change back, and that change shows on the chain next to your coins. A single coin of exactly ${sats(exact)} sats goes in with no change at all, so nothing ties your mixed output to anything. You can make it now: a payment to yourself, paid with the coins you tick, which needs one confirmation before it can join.`),
         h('div', { class: 'btns' }, h('button', { class: 'soft', onclick: () => { m.remove(); submit(); } }, 'NOT NEEDED, CONTINUE'),
-          h('button', { class: 'primary', onclick: () => { m.remove(); prepareExact(exact); } }, 'MAKE THE PERFECT COIN')));
+          h('button', { class: 'primary', onclick: () => { m.remove(); prepareExact(exact, cjType()); } }, 'MAKE THE PERFECT COIN')));
     } else submit();
   });
   const toggle = op => {
@@ -674,12 +687,13 @@ function coinPicker() {
   const hasExact = coins.some(c => c.value === exact);
   return h('div', { class: 'panel' }, h('div', { class: 'label' }, k.title),
     poolPw ? h('div', {}, h('p', { class: 'small soft' }, '🔒 Private pool: its creator shares the password with the people invited. Without it the pool refuses you.'), poolPw) : null,
+    h('p', { class: 'small soft' }, `Only ${kindName(cjType())} coins can join this pool. Your other coins can still pay for an exact coin of this type.`),
     h('p', { class: 'small soft' }, maxIn > 1
       ? `Tick up to ${maxIn} confirmed coins that together make at least ${sats(k.amount)} sats plus your fee. The leftover comes back to a fresh change address; the mixed output goes to another fresh address of this wallet.`
       : `Pick ONE confirmed coin of at least ${sats(exact)} sats. Its leftover comes back to a fresh change address; the mixed output goes to another fresh address of this wallet.`),
     ok.length ? rows : h('p', { class: 'warnc small' }, 'No confirmed coin is big enough.'),
     shortRows, summary,
-    hasExact ? null : h('button', { class: 'link', onclick: () => prepareExact(exact) }, `＋ PREPARE AN EXACT COIN OF ${sats(exact)} SATS`),
+    hasExact ? null : h('button', { class: 'link', onclick: () => prepareExact(exact, cjType()) }, `＋ PREPARE AN EXACT COIN OF ${sats(exact)} SATS`),
     pw,
     h('div', { class: 'btns' }, h('button', { class: 'soft', onclick: cancelPick }, 'CANCEL'), use));
 }
@@ -688,9 +702,10 @@ function coinPicker() {
  * The perfect coin for a pool: a payment to a fresh address of this wallet of exactly the
  * amount plus the no-change fee, through the normal send review. Paid with unmixed coins only.
  */
-async function prepareExact(exact) {
+async function prepareExact(exact, script) {
   try {
-    const r = await api('coinjoin/exact', {});
+    // To a fresh address of the pool's type; paid with any of your coins (bc1q and bc1p alike).
+    const r = await api('coinjoin/exact', { script: script || 'p2wpkh' });
     const pool = (C.st.coins || []).filter(c => !c.inRound && !c.mixed && c.confirmations > 0).sort((a, b) => b.value - a.value);
     const pick = new Set(); let sum = 0;
     for (const c of pool) { if (sum >= exact + 500) break; pick.add(c.outpoint); sum += c.value; }
