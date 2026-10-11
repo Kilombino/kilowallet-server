@@ -458,8 +458,16 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
     /** Only a hot wallet of native SegWit coins can join (the app's rule): every input and output must look alike. */
     private fun coinjoinBlocker(): String? = when {
         mode() != "hot" -> "Coinjoin needs a wallet that can sign here: a watch-only wallet can't prove it owns a coin or sign the round."
-        type() != ScriptType.P2WPKH -> "Coinjoin needs native SegWit (bc1q) addresses: every coin and output in a round must look the same, or yours would stand out."
+        type() != ScriptType.P2WPKH && type() != ScriptType.P2TR ->
+            "Coinjoin needs native SegWit (bc1q) or Taproot (bc1p) addresses: every coin and output in a round must look the same, or yours would stand out."
         else -> null
+    }
+
+    /** The coins a create/join asks for: `coins` (a list) or the older single `coin`. */
+    private fun cjCoins(w: NodeWallet, b: JSONObject): List<NodeWallet.Utxo> {
+        val ops = b.optJSONArray("coins")?.let { a -> (0 until a.length()).map { a.getString(it) } } ?: listOf(b.getString("coin"))
+        require(ops.isNotEmpty() && ops.toSet().size == ops.size) { "Pick each coin once." }
+        return ops.map { cjCoin(w, it) }
     }
 
     private fun cjCoin(w: NodeWallet, outpoint: String): NodeWallet.Utxo {
@@ -513,10 +521,13 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
                 require(maxPeers in Protocol.MIN_PEERS..Protocol.MAX_PEERS) { "Most people: ${Protocol.MIN_PEERS} to ${Protocol.MAX_PEERS}." }
                 require(minPeers in Protocol.MIN_PEERS..maxPeers) { "Fewest people: ${Protocol.MIN_PEERS} to $maxPeers (the most)." }
                 require(hours in 1..72) { "Open for 1 to 72 hours." }
-                val u = cjCoin(w, b.getString("coin"))
-                require(u.value >= CoinjoinTx.minimumCoin(amount, rate)) { "That coin is too small for this pool." }
+                val maxInputs = b.optInt("maxInputs", 1)
+                require(maxInputs in 1..Protocol.MAX_INPUTS) { "Coins per person: 1 to ${Protocol.MAX_INPUTS}." }
+                val us = cjCoins(w, b)
+                require(us.size <= maxInputs) { "At most $maxInputs coin(s) per person in this pool." }
+                require(CoinjoinTx.change(us.sumOf { it.value }, amount, rate, us.size, type()) != null) { "These coins are too small for this pool." }
                 val s = recheck(b)
-                val st = coinjoin.create(s, w, u, amount, rate, minPeers, maxPeers, hours, b.optString("poolPassword"))
+                val st = coinjoin.create(s, w, us, amount, rate, minPeers, maxPeers, hours, b.optString("poolPassword"), maxInputs)
                 reply(ex, 200, JSONObject().put("pool", st.poolId))
             }
             "/api/coinjoin/join" -> {
@@ -525,10 +536,10 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
                     ?: runCatching { coinjoin.fetchPools() }.getOrNull()?.also { pools = it }?.firstOrNull { it.id == id }
                     ?: error("That pool is no longer open.")
                 require(!t.private || b.optString("poolPassword").isNotEmpty()) { "Type the pool's password first." }
-                val u = cjCoin(w, b.getString("coin"))
-                require(u.value >= CoinjoinTx.minimumCoin(t.amount, t.feeRate)) { "That coin is too small for this pool." }
+                val us = cjCoins(w, b)
+                require(CoinjoinTx.change(us.sumOf { it.value }, t.amount, t.feeRate, us.size, t.script) != null) { "These coins are too small for this pool." }
                 val s = recheck(b)
-                coinjoin.join(s, w, u, t, b.optString("poolPassword"))
+                coinjoin.join(s, w, us, t, b.optString("poolPassword"))
                 reply(ex, 200, ok())
             }
             "/api/coinjoin/close" -> { coinjoin.session(b.getString("pool")).requestClose(); reply(ex, 200, ok()) }
@@ -556,11 +567,15 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
     private fun termsJson(t: Protocol.Terms) = JSONObject()
         .put("id", t.id).put("amount", t.amount).put("feeRate", t.feeRate).put("peers", t.peers)
         .put("minPeers", t.minPeers).put("maxPeers", t.maxPeers).put("expiresAt", t.expiresAt).put("private", t.private)
-        .put("feeWithChange", CoinjoinTx.feeShare(t.feeRate, true)).put("feeNoChange", CoinjoinTx.feeShare(t.feeRate, false))
+        .put("feeWithChange", CoinjoinTx.feeShare(t.feeRate, true, 1, t.script)).put("feeNoChange", CoinjoinTx.feeShare(t.feeRate, false, 1, t.script))
+        .put("script", Protocol.scriptName(t.script)).put("maxInputs", t.maxInputs).put("version", t.version)
+        .put("joinable", t.script == type())
 
     private fun coinjoinJson(w: NodeWallet): JSONObject {
         val o = JSONObject().put("enabled", coinjoin.enabled).put("relay", Protocol.RELAY)
             .put("blocker", coinjoinBlocker() ?: JSONObject.NULL).put("settings", cjSettingsJson())
+            .put("script", Protocol.scriptName(if (type() == ScriptType.P2TR) ScriptType.P2TR else ScriptType.P2WPKH))
+            .put("maxInputs", Protocol.MAX_INPUTS)
             .put("unlockedForAutoSign", secret != null)
             .put("limits", JSONObject().put("minAmount", Protocol.MIN_AMOUNT).put("maxAmount", Protocol.MAX_AMOUNT)
                 .put("minPeers", Protocol.MIN_PEERS).put("maxPeers", Protocol.MAX_PEERS).put("voteMinutes", Protocol.VOTE_SECONDS / 60)
@@ -572,6 +587,7 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
             o.put("coins", JSONArray(us.map { u ->
                 JSONObject().put("outpoint", u.outpoint).put("value", u.value).put("confirmations", u.confirmations)
                     .put("mixed", isMixed(w, u, mixed)).put("change", u.branch == 1).put("inRound", u.outpoint in locked)
+                    .put("address", w.address(u.branch, u.index))
             }))
         }
         return o
@@ -584,11 +600,12 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
             .put("creator", st.creator).put("private", st.terms.private).put("phase", st.phase.name).put("reason", st.reason)
             .put("people", people).put("minPeers", st.terms.minPeers).put("maxPeers", st.terms.maxPeers)
             .put("expiresAt", st.terms.expiresAt).put("phaseDeadline", st.phaseDeadline).put("voteDeadline", st.voteDeadline)
-            .put("coinValue", st.seat.coin.value).put("change", st.seat.changeValue)
+            .put("coinValue", st.seat.inputValue).put("coins", st.seat.coins.size).put("change", st.seat.changeValue)
+            .put("script", Protocol.scriptName(st.terms.script))
             .put("iAsked", st.voteBy != null && st.voteBy == st.token?.let { Protocol.tokenHash(it) })
             .put("voted", st.votedOn != null && st.votedOn == st.voteId)
             .put("signed", st.postedSig).put("sigs", st.sigs.size).put("txid", st.txid ?: "")
-            .put("planFee", plan?.fee ?: 0).put("planPeople", plan?.coins?.size ?: 0)
+            .put("planFee", plan?.fee ?: 0).put("planPeople", st.round.size).put("planCoins", plan?.coins?.size ?: 0)
             .put("planIdentical", plan?.outputs?.count { it.value == st.terms.amount } ?: 0)
     }
 

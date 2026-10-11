@@ -15,7 +15,7 @@ import java.io.File
  */
 fun main() {
     val env = System.getenv()
-    env["KILOWALLET_NETWORK"]?.let { com.kilombino.pyblockwatch.coinjoin.Protocol.NETWORK = it }
+    env["KILOWALLET_NETWORK"]?.let { com.kilombino.pyblockwatch.coinjoin.Protocol.NETWORK = it; NodeWallet.testnet = it != "blake2b" }
     val dir = File(env["KILOWALLET_DATA"] ?: "/data").apply { mkdirs() }
     val rpc = Rpc(env["BITCOIN_RPC_URL"] ?: "http://127.0.0.1:8332/", env["BITCOIN_RPC_USER"], env["BITCOIN_RPC_PASS"], env["BITCOIN_RPC_COOKIE"])
     val port = (env["KILOWALLET_PORT"] ?: "8080").toInt()

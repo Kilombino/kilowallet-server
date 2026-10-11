@@ -21,7 +21,8 @@ import java.io.File
 class NodeWallet(private val dir: File, private val rpc: Rpc, accountKey: String, val type: ScriptType) {
     private val account = Bip32.parseExtendedPubKey(accountKey)
     /** The key as the node's descriptors want it: "xpub" version bytes on mainnet. */
-    private val descKey = toVersion(accountKey, 0x0488B21E)
+    // The node's descriptors want an xpub on mainnet and a tpub on regtest/testnet (tests only).
+    private val descKey = toVersion(accountKey, if (testnet) 0x043587CF else 0x0488B21E)
     /** One node wallet per account key, so switching wallets never mixes their history. */
     val name = "kilowallet-" + Hashes.sha256(descKey.toByteArray()).toHex().take(10)
     private val stateFile = File(dir, "addresses.json")
@@ -168,6 +169,8 @@ class NodeWallet(private val dir: File, private val rpc: Rpc, accountKey: String
     fun broadcast(hex: String): String = rpc.call("sendrawtransaction", hex) as String
 
     companion object {
+        /** Set for a regtest/testnet node (KILOWALLET_NETWORK not "blake2b"): tests only. */
+        @Volatile var testnet = false
         const val GAP = 20
         const val RANGE = 999
 
