@@ -809,5 +809,5 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
         return o
     }
 
-    companion object { const val VERSION = "0.4.0" }
+    companion object { const val VERSION = "0.4.1" }
 }

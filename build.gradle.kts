@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "com.kilombino.kilowallet"
-version = "0.4.0"
+version = "0.4.1"
 
 kotlin {
     jvmToolchain(17)

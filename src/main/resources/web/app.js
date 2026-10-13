@@ -453,21 +453,39 @@ function coinjoinView() {
   const st = C.st;
   if (!st) return h('div', { class: 'panel' }, h('p', { class: 'faint small' }, 'Loading…'));
   if (!st.enabled) return coinjoinIntro();
-  const parts = [h('div', { class: 'panel' }, h('div', { class: 'label' }, 'Coinjoin'),
-    h('p', { class: 'small soft' }, 'Mix your coins with other people\'s: everyone puts one or more coins in and gets back an output of exactly the pool\'s amount, all identical, so nobody watching the chain can tell whose is whose. Each person pays their own share of the fee from their change. No server ever holds your coins: the relay only passes encrypted messages, and you sign only after checking your output.'))];
-  if (st.blocker) { parts.push(h('div', { class: 'panel warn' }, h('p', { class: 'small' }, st.blocker))); return h('div', {}, parts); }
+  const intro = h('div', { class: 'panel' }, h('div', { class: 'label' }, 'Coinjoin'),
+    h('p', { class: 'small soft' }, 'Mix your coins with other people\'s: everyone puts one or more coins in and gets back an output of exactly the pool\'s amount, all identical, so nobody watching the chain can tell whose is whose. Each person pays their own share of the fee from their change. No server ever holds your coins: the relay only passes encrypted messages, and you sign only after checking your output.'));
+  const parts = [];
+  if (st.blocker) { parts.push(intro, h('div', { class: 'panel warn' }, h('p', { class: 'small' }, st.blocker))); return h('div', {}, parts); }
   if (C.msg) parts.push(h('div', { class: 'panel warn' }, h('p', { class: 'warnc small' }, C.msg),
     h('button', { class: 'link faint', onclick: () => { C.msg = null; render(); } }, 'ok')));
   const mine = st.mine || [];
-  if (mine.length) parts.push(h('div', { class: 'label mt' }, 'Your pools'), mine.map(myPool));
-  (st.waitingExact || []).forEach(x => parts.push(h('div', { class: 'panel' }, h('div', { class: 'label' }, 'Waiting for the perfect coin'),
-    h('p', { class: 'small soft' }, `${sats(x.value)} sats to yourself: at its first confirmation it ${x.create ? 'opens your pool' : 'joins the pool'} by itself.`))));
   if (C.pick) { parts.push(coinPicker()); return h('div', {}, parts); }
   if (C.create) { parts.push(createForm()); return h('div', {}, parts); }
+  // JOIN · IN PROGRESS · HISTORY, as in the app: rounds going are shown first when there are any.
+  const over = p => ['CONFIRMED', 'ABORTED', 'REJECTED'].includes(p.phase);
+  const active = mine.filter(p => !over(p)), finished = mine.filter(over);
+  const waiting = st.waitingExact || [];
+  if (C.cjTab == null) C.cjTab = active.length || waiting.length ? 1 : 0;
+  parts.push(h('div', { class: 'tabs cjtabs mt' }, ['JOIN', 'IN PROGRESS', 'HISTORY'].map((l, i) =>
+    h('button', { class: C.cjTab === i ? 'on' : '', onclick: () => { C.cjTab = i; render(); } }, l,
+      i === 1 && active.length ? h('span', { class: 'count' }, String(active.length)) : null))));
+  if (C.cjTab === 1) {
+    if (!active.length && !waiting.length) parts.push(h('p', { class: 'faint small mt' }, 'No rounds going. Join a pool, or open your own, in JOIN.'));
+    parts.push(active.map(roundCard));
+    waiting.forEach(x => parts.push(h('div', { class: 'panel' }, h('div', { class: 'label' }, 'Waiting for the perfect coin'),
+      h('p', { class: 'small soft' }, `${sats(x.value)} sats to yourself: at its first confirmation it ${x.create ? 'opens your pool' : 'joins the pool'} by itself.`))));
+    return h('div', {}, parts);
+  }
+  if (C.cjTab === 2) {
+    if (!finished.length) parts.push(h('p', { class: 'faint small mt' }, 'Confirmed and cancelled rounds show here, for a week.'));
+    else parts.push(finished.map(roundCard), h('button', { class: 'link faint', onclick: async () => { for (const p of finished) await api('coinjoin/remove', { pool: p.id }).catch(() => {}); await loadCoinjoin(); render(); } }, 'remove all'));
+    return h('div', {}, parts);
+  }
   parts.push(h('div', { class: 'btns' }, h('button', { class: 'primary', onclick: () => {
     C.create = { amount: '100000', rate: '1', min: '2', max: '5', hours: '6', inputs: '5', password: '', script: C.st.segwit === false ? 'p2tr' : 'p2wpkh' }; render();
   } }, '＋  OPEN A POOL')));
-  parts.push(openPools(mine), notificationsPanel(), autoSignPanel(), howPanel());
+  parts.push(openPools(mine), intro, autoSignPanel(), notificationsPanel(), howPanel());
   return h('div', {}, parts);
 }
 
@@ -517,7 +535,7 @@ function confirmLeave(p) {
       h('button', { class: 'primary', onclick: () => { m.remove(); cjAct('coinjoin/leave', { pool: p.id }); } }, p.creator ? 'END POOL' : 'LEAVE')));
 }
 
-function myPool(p) {
+function myPool(p, embedded) {
   const cls = p.phase === 'CONFIRMED' ? 'good' : ['ABORTED', 'REJECTED'].includes(p.phase) ? 'badc' : ['VOTING', 'SIGNING'].includes(p.phase) ? 'warnc' : 'soft';
   const leaveBtn = h('button', { class: 'soft', onclick: () => confirmLeave(p) }, p.creator ? 'END POOL' : 'LEAVE');
   const acts = [];
@@ -547,6 +565,8 @@ function myPool(p) {
     h('div', { class: 'row' }, h('button', { class: 'link', onclick: () => window.open(S.w.settings.explorer + '/tx/' + p.txid, '_blank', 'noopener') }, 'open in explorer'),
       p.phase === 'CONFIRMED' ? h('button', { class: 'link faint', onclick: () => cjAct('coinjoin/remove', { pool: p.id }) }, 'remove') : null));
   if (['ABORTED', 'REJECTED'].includes(p.phase)) acts.push(h('button', { class: 'link faint', onclick: () => cjAct('coinjoin/remove', { pool: p.id }) }, 'remove'));
+  const coinLine = h('p', { class: 'faint small' }, `${p.coins > 1 ? 'your ' + p.coins + ' coins' : 'your coin'} ${sats(p.coinValue)} → ${sats(p.amount)} mixed${p.change > 0 ? ' + ' + sats(p.change) + ' change' : ''} · fee ${sats(p.coinValue - p.amount - p.change)}`);
+  if (embedded) return h('div', { class: 'mt' }, coinLine, acts);
   return h('div', { class: 'panel' + (['VOTING', 'SIGNING'].includes(p.phase) ? ' warn' : ['ABORTED', 'REJECTED'].includes(p.phase) ? ' bad' : '') },
     h('div', { class: 'between' }, h('span', { class: 'mid' }, sats(p.amount) + ' sats' + (p.script === 'p2tr' ? ' · Taproot' : '')), h('span', { class: 'faint small' }, (p.private ? '🔒 ' : '') + (p.creator ? 'your pool' : 'joined'))),
     h('p', { class: cls + ' small' }, phaseText(p)),
@@ -798,3 +818,49 @@ async function pollEvents() {
 }
 
 boot().catch(e => { $app.replaceChildren(h('div', { class: 'panel bad' }, e.message)); });
+
+// ------------------------------------------------------------------ coinjoin: round cards
+
+/** Where a round is, 1..5: people, closing vote, outputs and signatures, sent, confirmed (0: ended without). */
+function roundStep(p) {
+  return { JOINING: 1, OPEN: 1, VOTING: 2, CLOSING: 3, SIGNING: 3, BROADCAST: 4, CONFIRMED: 5 }[p.phase] || 0;
+}
+
+/** True while the round waits on you: an answer, or a signature by hand. */
+function roundNeedsMe(p) {
+  if ((C.st.settings || {}).auto_sign) return false;
+  return (p.phase === 'VOTING' && !p.iAsked && !p.voted) || (p.phase === 'SIGNING' && !p.signed);
+}
+
+/** One round at a glance: amount, the bar of its five steps, what is happening and where your coin is. */
+function roundCard(p) {
+  const step = roundStep(p), ended = step === 0;
+  C.open = C.open || {};
+  const open = p.id in C.open ? C.open[p.id] : roundNeedsMe(p);
+  const status = {
+    JOINING: 'Asking to join',
+    OPEN: `Waiting for people · ${p.people}/${p.maxPeers} people · closes at ${hhmm(p.expiresAt)}`,
+    VOTING: roundNeedsMe(p) ? `Closing vote · your answer, by ${hhmm(p.voteDeadline)}` : `Closing vote · ${p.people} people`,
+    CLOSING: `Closing · ${p.people} people · collecting outputs`,
+    SIGNING: p.signed ? 'Signed · waiting for the others' : roundNeedsMe(p) ? 'Ready to sign' : 'Signing',
+    BROADCAST: 'Sent · waiting for a block', CONFIRMED: 'Confirmed', ABORTED: 'Cancelled', REJECTED: 'Refused',
+  }[p.phase] || p.phase;
+  const where = p.phase === 'BROADCAST' ? 'Your coin left in the group transaction. Waiting for a block.'
+    : p.phase === 'CONFIRMED' ? `Done: your mixed coin of ${sats(p.amount)} sats is in your wallet.`
+    : ended ? `${(p.reason || 'ended').replace(/^./, c => c.toUpperCase())}. Your coin did not move.`
+    : 'Your coin is still in your wallet — it hasn\'t left.';
+  const cls = ended ? 'badc' : step === 5 ? 'good' : 'accent';
+  const dots = [];
+  for (let i = 1; i <= 5; i++) {
+    dots.push(h('span', { class: 'dot' + (i < step || step === 5 ? ' done' : i === step ? ' now' : '') }));
+    if (i < 5) dots.push(h('span', { class: 'bar' + (i < step ? ' done' : '') }));
+  }
+  return h('div', { class: 'panel round' + (ended ? ' bad' : '') },
+    h('div', { class: 'tap', onclick: () => { C.open[p.id] = !open; render(); } },
+      h('div', { class: 'between' }, h('span', { class: 'mid' }, (p.private ? '🔒 ' : '') + sats(p.amount) + ' sats each' + (p.script === 'p2tr' ? ' · Taproot' : '')),
+        h('span', { class: cls + ' mid' }, (ended ? '' : step + '/5 ') + (open ? '⌄' : '›'))),
+      ended ? null : h('div', { class: 'steps' }, dots),
+      h('p', { class: cls }, status),
+      h('p', { class: 'soft small' }, where)),
+    open ? myPool(p, true) : null);
+}

@@ -39,3 +39,16 @@ summary { cursor:pointer; padding:6px 0; }
 .pick { cursor:pointer; border-radius:10px; padding:10px; margin:2px 0; } .pick.sel { background:rgba(185,107,255,.15); }
 /* Ark: the engine log. */
 pre.log { white-space:pre-wrap; max-height:60vh; overflow:auto; background:#05020a; border:1px solid var(--line); border-radius:10px; padding:10px; }
+
+/* Coinjoin round cards: the bar of five steps, as in the app. */
+.tabs .count { display:inline-block; margin-left:6px; background:var(--purple); color:#000; border-radius:10px; padding:0 6px; font-size:11px; }
+.tabs button.on .count { background:#000; color:var(--purple); }
+.round .tap { cursor:pointer; }
+.round .accent { color:var(--purple); }
+.steps { display:flex; align-items:center; margin:10px 0 6px; }
+.steps .dot { width:12px; height:12px; border-radius:50%; border:1.5px solid var(--faint); flex:none; box-sizing:border-box; }
+.steps .dot.done { background:var(--good); border-color:var(--good); }
+.steps .dot.now { background:var(--purple); border-color:var(--purple); }
+.steps .bar { flex:1; height:2px; background:var(--line); }
+.steps .bar.done { background:var(--good); }
+.cjtabs button { white-space:nowrap; font-size:12px; padding:10px 2px; }
