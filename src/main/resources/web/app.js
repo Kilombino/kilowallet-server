@@ -19,7 +19,7 @@ function h(tag, attrs, ...kids) {
     else if (k === 'value') e.value = v;
     else e.setAttribute(k, v === true ? '' : v);
   }
-  for (const c of kids.flat()) if (c != null && c !== false) e.append(c instanceof Node ? c : document.createTextNode(String(c)));
+  for (const c of kids.flat(Infinity)) if (c != null && c !== false) e.append(c instanceof Node ? c : document.createTextNode(String(c)));
   return e;
 }
 const sats = n => (n < 0 ? '-' : '') + Math.abs(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
@@ -460,6 +460,8 @@ function coinjoinView() {
     h('button', { class: 'link faint', onclick: () => { C.msg = null; render(); } }, 'ok')));
   const mine = st.mine || [];
   if (mine.length) parts.push(h('div', { class: 'label mt' }, 'Your pools'), mine.map(myPool));
+  (st.waitingExact || []).forEach(x => parts.push(h('div', { class: 'panel' }, h('div', { class: 'label' }, 'Waiting for the perfect coin'),
+    h('p', { class: 'small soft' }, `${sats(x.value)} sats to yourself: at its first confirmation it ${x.create ? 'opens your pool' : 'joins the pool'} by itself.`))));
   if (C.pick) { parts.push(coinPicker()); return h('div', {}, parts); }
   if (C.create) { parts.push(createForm()); return h('div', {}, parts); }
   parts.push(h('div', { class: 'btns' }, h('button', { class: 'primary', onclick: () => {
@@ -705,7 +707,11 @@ function coinPicker() {
 async function prepareExact(exact, script) {
   try {
     // To a fresh address of the pool's type; paid with any of your coins (bc1q and bc1p alike).
-    const r = await api('coinjoin/exact', { script: script || 'p2wpkh' });
+    // Once it confirms, the server joins this pool (or opens the one being set up) by itself.
+    const after = C.create && C.pick ? { create: { amount: C.pick.amount, feeRate: C.pick.rate, minPeers: Number(C.create.min), maxPeers: Number(C.create.max),
+        hours: Number(C.create.hours), poolPassword: C.create.password || '', maxInputs: C.pick.maxInputs || 1 } }
+      : C.join ? { pool: C.join.pool.id, poolPassword: C.join.password || '' } : null;
+    const r = await api('coinjoin/exact', { script: script || 'p2wpkh', exact, after });
     const pool = (C.st.coins || []).filter(c => !c.inRound && !c.mixed && c.confirmations > 0).sort((a, b) => b.value - a.value);
     const pick = new Set(); let sum = 0;
     for (const c of pool) { if (sum >= exact + 500) break; pick.add(c.outpoint); sum += c.value; }
@@ -713,7 +719,8 @@ async function prepareExact(exact, script) {
     C.pick = null; C.join = null; C.create = null; C.chosen = [];
     S.tab = 'btc'; S.sheet = 'send'; S.draft = null; S.sent = null; S.psbt = null;
     render(); window.scrollTo(0, 0);
-    toast(`A payment to yourself of exactly ${sats(exact)} sats: tick the coins to pay it with (coin control), review it. It can join once it has one confirmation.`);
+    toast(`A payment to yourself of exactly ${sats(exact)} sats: tick the coins to pay it with (coin control), review it. ` +
+      (after ? 'Once it has one confirmation it ' + (after.create ? 'opens the pool' : 'joins the pool') + ' by itself.' : 'It can join once it has one confirmation.'));
   } catch (e) { toast(e.message); }
 }
 
@@ -750,8 +757,7 @@ function autoSignPanel() {
   return h('div', { class: 'panel' }, h('div', { class: 'label' }, 'Sign on its own'),
     h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: !!st.auto_sign, onchange: e => api('coinjoin/settings', { auto_sign: e.target.checked }).then(s => { C.st.settings = s; }).catch(er => toast(er.message)) }),
       h('span', {}, 'Accept close requests and sign by itself')),
-    h('p', { class: 'small faint' }, 'So a round does not wait for you. It signs only when the final transaction checks out (your mixed output, your change and your share of the fee), and only while this wallet is unlocked on the server; otherwise it does not sign and tells you why.'),
-    st.auto_sign && !C.st.unlockedForAutoSign ? h('p', { class: 'warnc small' }, 'Locked: unlock it to let it sign.') : null,
+    h('p', { class: 'small faint' }, 'The password you give when opening or joining a pool is the only one: the round goes on with this page closed, and signs only when the final transaction checks out (your mixed output, your change and your share of the fee). The keys of that round\'s coins stay in the server\'s memory until it ends; if the service restarts, unlock Kilowallet once to let it sign.'),
     h('button', { class: 'link faint', onclick: () => api('coinjoin/enable', { on: false }).then(r => { C.st = r; C.pools = null; S.tab = 'btc'; render(); }).catch(e => toast(e.message)) }, 'turn coinjoin off'));
 }
 

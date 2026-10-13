@@ -216,8 +216,11 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
                 require(Spend.concern(d) == null || b.optBoolean("acceptFee")) { Spend.concern(d)!! }
                 mixWarnings[d.id]?.let { m -> require(b.optBoolean("acceptMix")) { m } }
                 requireUnlocked(d)
-                val signed = Spend.sign(recheck(b), d)
+                val sec = recheck(b)
+                val signed = Spend.sign(sec, d)
                 val txid = w.broadcast(signed.rawHex).also { w.noteSent(it) }
+                // The perfect coin of a pool: its key goes with it, so the pool goes on by itself.
+                runCatching { coinjoin.exactSigned(d.toAddress, d.amount, sec) }
                 d.changeIndex?.let { w.freshChange() }
                 drafts.remove(d.id); mixWarnings.remove(d.id)
                 reply(ex, 200, JSONObject().put("txid", txid))
@@ -591,8 +594,22 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
             // The perfect coin for a pool: a payment to a fresh address of this wallet nobody has seen.
             "/api/coinjoin/exact" -> {
                 // Of the pool's type, whatever coins pay for it.
-                val (i, script) = cjWallet(if (b.optString("script") == "p2tr") ScriptType.P2TR else ScriptType.P2WPKH).reserveReceive()
-                reply(ex, 200, JSONObject().put("index", i).put("address", Spend.addressOf(script)))
+                val t = if (b.optString("script") == "p2tr") ScriptType.P2TR else ScriptType.P2WPKH
+                val (i, script) = cjWallet(t).reserveReceive()
+                val address = Spend.addressOf(script)
+                // What to do once it confirms: join that pool, or open the one being set up.
+                val after = b.optJSONObject("after")
+                if (after != null && b.optLong("exact", 0) > 0) {
+                    val c = after.optJSONObject("create")
+                    if (c != null) {
+                        require(c.optLong("amount") in Protocol.MIN_AMOUNT..Protocol.MAX_AMOUNT && c.optDouble("feeRate") in 1.0..500.0 &&
+                            c.optInt("maxPeers") in Protocol.MIN_PEERS..Protocol.MAX_PEERS && c.optInt("minPeers") in Protocol.MIN_PEERS..c.optInt("maxPeers") &&
+                            c.optInt("hours") in 1..72 && c.optInt("maxInputs", 1) in 1..Protocol.MAX_INPUTS) { "Check the pool's settings." }
+                    }
+                    coinjoin.expectExact(address, Coinjoin.AfterExact(t, i, b.getLong("exact"),
+                        after.optString("pool").ifEmpty { null }, after.optString("poolPassword").ifEmpty { null }, c))
+                }
+                reply(ex, 200, JSONObject().put("index", i).put("address", address))
             }
             else -> reply(ex, 404, err("not found"))
         }
@@ -620,6 +637,7 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
             .put("taproot", walletFor(ScriptType.P2TR) != null).put("segwit", walletFor(ScriptType.P2WPKH) != null)
             .put("maxInputs", Protocol.MAX_INPUTS)
             .put("unlockedForAutoSign", secret != null)
+            .put("waitingExact", JSONArray(coinjoin.waitingExact().map { JSONObject().put("value", it.value).put("create", it.create != null) }))
             .put("limits", JSONObject().put("minAmount", Protocol.MIN_AMOUNT).put("maxAmount", Protocol.MAX_AMOUNT)
                 .put("minPeers", Protocol.MIN_PEERS).put("maxPeers", Protocol.MAX_PEERS).put("voteMinutes", Protocol.VOTE_SECONDS / 60)
                 .put("joinMinutes", PoolSession.JOIN_TIMEOUT / 60).put("dust", CoinjoinTx.DUST))
@@ -791,5 +809,5 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
         return o
     }
 
-    companion object { const val VERSION = "0.3.0" }
+    companion object { const val VERSION = "0.4.0" }
 }
