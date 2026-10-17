@@ -58,13 +58,21 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
     private val mixWarnings = ConcurrentHashMap<String, String>()
     /** Ark (the app's ARK tab): the engine, run with this wallet's words. */
     val ark = ArkEngine(dir, arkRpc.url, arkRpc.user, arkRpc.pass, arkRpc.cookie, coinjoin) { runCatching { rpc.height() }.getOrNull() }
+    /**
+     * Which chain the node follows ([ChainCheck]), checked at start and every minute. Until it is
+     * known to be the BLAKE2b chain nothing touches the node's wallets: no watch-only wallet is
+     * created or loaded, nothing is scanned or sent, coinjoin rounds wait.
+     */
+    @Volatile private var chain: ChainCheck.Result =
+        if (NodeWallet.testnet) ChainCheck.Result(ChainCheck.State.SKIPPED) else ChainCheck.Result(ChainCheck.State.UNREACHABLE, detail = "not checked yet")
+    @Volatile private var nodeWorkStarted = false
 
     init {
         coinjoin.secretProvider = { secret }
-        coinjoin.load(); coinjoin.startAll(); coinjoin.startPoolWatcher()
+        coinjoin.load()
         server.executor = Executors.newFixedThreadPool(8)
         server.createContext("/") { ex -> runCatching { route(ex) }.onFailure { e -> runCatching { reply(ex, 400, err(e.message ?: "error")) } } }
-        openWallet()
+        Executors.newSingleThreadScheduledExecutor().scheduleWithFixedDelay({ runCatching { checkChain() } }, 0, 60, java.util.concurrent.TimeUnit.SECONDS)
         ark.startTimers()
         Runtime.getRuntime().addShutdownHook(Thread { runCatching { ark.shutdown() } })
     }
@@ -76,6 +84,25 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
             if (cfg().optBoolean("prices", true)) market = runCatching { fetchJson("https://mempool.kilombino.com/api/v1/blake2b/widget") }.getOrNull()
         }, 0, 15, java.util.concurrent.TimeUnit.MINUTES)
     }
+
+    // ------------------------------------------------------------------ the node's chain
+
+    @Synchronized private fun checkChain() {
+        val was = chain
+        val now = if (NodeWallet.testnet) ChainCheck.Result(ChainCheck.State.SKIPPED)
+            else runCatching { ChainCheck.check(rpc) }.getOrElse { ChainCheck.Result(ChainCheck.State.UNREACHABLE, detail = it.message) }
+        // A node that stops answering for a moment is not a different chain: keep a good verdict.
+        if (now.state == ChainCheck.State.UNREACHABLE && was.ok) return
+        chain = now
+        if (now.state != was.state) System.err.println("Node chain: ${now.state} (${now.title()}) at block ${now.height}")
+        if (now.ok && !was.ok) {
+            // Opening is idempotent (a wallet already in the node is only loaded), so it runs again after a bad spell.
+            runCatching { openWallet() }
+            if (!nodeWorkStarted) { nodeWorkStarted = true; coinjoin.startAll(); coinjoin.startPoolWatcher() }
+        }
+    }
+
+    private fun requireChain() { check(chain.ok) { chain.title() + ". " + chain.message() } }
 
     // ------------------------------------------------------------------ config
 
@@ -98,7 +125,7 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
         walletError = null
         importing = restored
         Thread {
-            runCatching { w.ensure(rescanFrom ?: if (restored) w.autoSince() else null) }.also { importing = false }.onFailure {
+            runCatching { requireChain(); w.ensure(rescanFrom ?: if (restored) w.autoSince() else null) }.also { importing = false }.onFailure {
                 walletError = "The node could not open this wallet's history: ${it.message}. The node needs its wallet " +
                     "feature enabled (not disablewallet)."
             }
@@ -112,7 +139,7 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
         if (mode() != "hot" || type() != ScriptType.P2WPKH) { walletTr = null; return }
         val key = cfg().optString("accountKeyTr").takeIf { it.isNotEmpty() } ?: return
         val w = NodeWallet(dir, rpc, key, ScriptType.P2TR)
-        Thread { runCatching { w.ensure(rescanFrom ?: runCatching { w.autoSince() }.getOrNull()) }
+        Thread { runCatching { requireChain(); w.ensure(rescanFrom ?: runCatching { w.autoSince() }.getOrNull()) }
             .onFailure { System.err.println("Taproot account: ${it.message}") } }.start()
         walletTr = w
     }
@@ -185,7 +212,9 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
         }
         if (!p.startsWith("/api/")) return static(ex, if (p == "/") "index.html" else p.removePrefix("/"))
         if (p == "/api/state") return reply(ex, 200, JSONObject().put("mode", mode()).put("unlocked", authed(ex))
-            .put("version", javaClass.`package`?.implementationVersion ?: VERSION))
+            .put("version", javaClass.`package`?.implementationVersion ?: VERSION).put("chain", chain.json()))
+        // A node on another chain (or not known yet to be on this one): nothing but locking goes through.
+        if (!chain.ok && p != "/api/lock") return reply(ex, 503, err(chain.title() + ". " + chain.message()).put("chain", chain.json()))
         val b = if (ex.requestMethod == "POST") body(ex) else JSONObject()
         when (p) {
             "/api/setup/new" -> return setupNew(ex, b)
@@ -809,5 +838,5 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
         return o
     }
 
-    companion object { const val VERSION = "0.4.2" }
+    companion object { const val VERSION = "0.4.3" }
 }

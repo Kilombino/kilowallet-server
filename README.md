@@ -39,6 +39,14 @@ java -jar build/libs/kilowallet-server.jar
 
 The node needs its wallet feature (not `disablewallet=1`).
 
+On mainnet the server first checks that the node follows the BLAKE2b chain, at start and every
+minute: from block 961,640 the BLAKE2b chain's headers are 164 bytes and the SHA-256 chain's are
+still 80, so it reads the raw header of the node's best block (or, while it syncs, of its best
+header). A node on the SHA-256 chain, a node stopped on the last block before the fork (a Knots
+version without BLAKE2b) or one still syncing below it gets a page that says so and nothing else:
+no watch-only wallet is created or loaded, nothing is scanned or sent. Tests on regtest or testnet
+(`KILOWALLET_NETWORK` other than `blake2b`) skip it.
+
 ### Ark
 
 The engine is the app's own: the Paperclip/bark wallet (Rust), as its own process

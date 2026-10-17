@@ -31,6 +31,7 @@ async function api(path, body) {
   const r = await fetch('/api/' + path, body === undefined ? {} : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   const j = await r.json().catch(() => ({ error: 'bad answer from the server' }));
   if (r.status === 401) { S.me.unlocked = false; render(); throw new Error('locked'); }
+  if (r.status === 503 && j.chain) { S.me.chain = j.chain; render(); throw new Error(j.chain.title); }
   if (j.error) throw new Error(j.error);
   return j;
 }
@@ -51,6 +52,13 @@ async function boot() {
   S.me = await api('state');
   if (S.me.unlocked) await loadWallet();
   render();
+  // While the node is not known to be on the BLAKE2b chain, keep asking: the page opens by itself once it is.
+  setInterval(async () => {
+    if (!S.me || !S.me.chain || S.me.chain.ok) return;
+    const me = await api('state').catch(() => null); if (!me) return;
+    S.me = me; if (me.chain.ok && me.unlocked) await loadWallet().catch(() => {});
+    render();
+  }, 20000);
   setInterval(async () => { if (S.me && S.me.unlocked && !busy() && document.visibilityState === 'visible') { await loadWallet().catch(() => {}); if (!busy()) render(); } }, 30000);
   startCoinjoinTimers();
   // Leaving the page puts street mode back on (as the app does).
@@ -66,9 +74,28 @@ async function loadWallet() {
 function render() {
   $app.replaceChildren();
   if (!S.me) return;
+  if (S.me.chain && !S.me.chain.ok) return $app.append(chainView());
   if (!S.me.mode) return $app.append(setupView());
   if (!S.me.unlocked) return $app.append(unlockView());
   $app.append(mainView());
+}
+
+// ------------------------------------------------------------------ the node's chain
+
+// The node follows another chain (or is not past the BLAKE2b fork yet): nothing else opens.
+function chainView() {
+  const c = S.me.chain;
+  const wait = c.state === 'syncing' || c.state === 'unreachable';
+  const again = () => api('state').then(async me => { S.me = me; if (me.chain.ok && me.unlocked) await loadWallet().catch(() => {}); render(); }).catch(e => toast(e.message));
+  return h('div', {},
+    h('div', { class: 'center' }, h('img', { src: 'icon-192.png', width: 96, height: 96, alt: '' })),
+    h('h1', { class: 'center' }, 'Kilowallet'),
+    h('p', { class: 'center soft small' }, 'BITCOIN BLAKE2b (XBT) WALLET · ON YOUR OWN NODE'),
+    h('div', { class: 'panel ' + (wait ? 'warn' : 'bad') },
+      h('div', { class: 'label' }, 'Node'),
+      h('p', { class: wait ? 'warnc' : 'badc' }, c.title),
+      h('p', { class: 'small soft' }, c.message),
+      h('div', { class: 'btns' }, h('button', { class: 'soft', onclick: again }, 'CHECK AGAIN'))));
 }
 
 // ------------------------------------------------------------------ setup / unlock

@@ -12,6 +12,9 @@ import java.io.File
  *   KILOWALLET_ARKD    the Ark engine binary (default /opt/kilowallet/kilombino-arkd)
  *   KILOWALLET_NETWORK coinjoin network name (default blake2b; tests use another, so their
  *                      pools never list on mainnet)
+ *
+ * On mainnet (KILOWALLET_NETWORK blake2b) the server first checks that the node follows the
+ * BLAKE2b chain ([ChainCheck]) and refuses to work with one on the SHA-256 chain.
  */
 fun main() {
     val env = System.getenv()
