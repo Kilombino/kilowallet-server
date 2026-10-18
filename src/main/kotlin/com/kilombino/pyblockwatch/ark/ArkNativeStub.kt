@@ -9,4 +9,6 @@ internal object ArkNative {
     fun secpPubkey(secret: ByteArray): ByteArray? = null
     fun secpEcdsaSign(secret: ByteArray, hash: ByteArray, lowR: Boolean): ByteArray? = null
     fun secpSchnorrSign(secret: ByteArray, msg: ByteArray, aux: ByteArray): ByteArray? = null
+    fun secpEcdh(secret: ByteArray, point: ByteArray): ByteArray? = null
+    fun secpTweakAdd(secret: ByteArray, tweak: ByteArray): ByteArray? = null
 }

@@ -612,7 +612,7 @@ function openPools(mine) {
       shown.length ? shown.map(t => h('div', { class: 'panel' }, h('div', { class: 'row' },
         h('div', { class: 'grow' },
           h('div', { class: 'mid' }, (t.private ? '🔒 ' : '') + sats(t.amount) + ' sats'),
-          h('div', { class: t.script === 'p2tr' ? 'good small' : 'soft small' }, `${kindName(t.script)} coins only · ${t.maxInputs > 1 ? 'up to ' + t.maxInputs + ' coins each' : 'one coin each'}`),
+          h('div', { class: t.script === 'p2tr' ? 'good small' : 'soft small' }, `${kindName(t.script)} coins only · ${t.maxInputs > 1 ? 'up to ' + t.maxInputs + ' coins each' : 'one coin each'}${t.version >= 3 ? ' · blind outputs (v3)' : ''}`),
           h('div', { class: 'soft small' }, `${t.peers}/${t.maxPeers} people (min ${t.minPeers}) · ${t.feeRate} sat/vB · closes in ${left(t.expiresAt)}`),
           h('div', { class: 'faint small' }, `joining costs you ${sats(t.feeWithChange)} sats in fees with one coin (${sats(t.feeNoChange)} with a coin of exactly ${sats(t.amount + t.feeNoChange)})`),
           t.joinable ? null : h('div', { class: 'warnc small' }, `This wallet's coins are ${kindName(cjType())}: it can't join this pool.`)),
@@ -646,7 +646,7 @@ function createForm() {
     const amount = Number(f.amount.replace(/\D/g, '')), rate = Number(f.rate.replace(',', '.'));
     btc.textContent = amount ? '= ' + (amount / 1e8).toFixed(8) + ' BTC' : '';
     costs.textContent = amount && rate >= 1 && rate <= 500 ? `A ${kindName(cjType())} pool (this wallet's type): only such coins can join, and every output is of that type. ` +
-      (cjType() === 'p2wpkh' && Number(f.inputs) === 1 ? 'One coin each: older Kilowallet and Kilojoin versions can join too. ' : 'Only Kilowallet 0.27+ and Kilojoin 0.5+ see this pool. ') +
+      'Blind outputs (Kilojoin v3): when the round closes, nobody, not even you as its creator, can tell whose mixed output is whose. Only Kilowallet 1.1.5+ and Kilojoin 0.7+ see this pool. ' +
       `Each person pays their own fee, the same however many join: with one coin ${feeShare(rate, true)} sats with change, ${feeShare(rate, false)} without; each extra coin adds ${Math.ceil(rate * inVb(cjType()))}. ` +
       `A coin of exactly ${sats(amount + feeShare(rate, false))} sats leaves no change (the best for privacy); a bit more than that, up to ${sats(amount + feeShare(rate, true) + L.dust)}, also goes in without change and the rest goes to the miners.` : '';
     pwNote.textContent = f.password ? 'Only people you give this password to can join. It is not announced anywhere.' : '';
