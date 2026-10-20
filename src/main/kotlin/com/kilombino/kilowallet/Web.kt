@@ -594,12 +594,14 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
                 require(hours in 1..72) { "Open for 1 to 72 hours." }
                 val maxInputs = b.optInt("maxInputs", 1)
                 require(maxInputs in 1..Protocol.MAX_INPUTS) { "Coins per person: 1 to ${Protocol.MAX_INPUTS}." }
+                val outputs = b.optInt("outputs", 1)
+                require(outputs in 1..Protocol.MAX_OUTPUTS) { "Mixed outputs per person: 1 to ${Protocol.MAX_OUTPUTS}." }
                 val pw = cjWallet(if (b.optString("script") == "p2tr") ScriptType.P2TR else ScriptType.P2WPKH)
                 val us = cjCoins(pw, b)
                 require(us.size <= maxInputs) { "At most $maxInputs coin(s) per person in this pool." }
-                require(CoinjoinTx.change(us.sumOf { it.value }, amount, rate, us.size, pw.type) != null) { "These coins are too small for this pool." }
+                require(CoinjoinTx.change(us.sumOf { it.value }, amount, rate, us.size, pw.type, outputs) != null) { "These coins are too small for this pool." }
                 val s = recheck(b)
-                val st = coinjoin.create(s, pw, us, amount, rate, minPeers, maxPeers, hours, b.optString("poolPassword"), maxInputs)
+                val st = coinjoin.create(s, pw, us, amount, rate, minPeers, maxPeers, hours, b.optString("poolPassword"), maxInputs, outputs)
                 reply(ex, 200, JSONObject().put("pool", st.poolId))
             }
             "/api/coinjoin/join" -> {
@@ -610,7 +612,7 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
                 require(!t.private || b.optString("poolPassword").isNotEmpty()) { "Type the pool's password first." }
                 val pw = cjWallet(t.script)
                 val us = cjCoins(pw, b)
-                require(CoinjoinTx.change(us.sumOf { it.value }, t.amount, t.feeRate, us.size, t.script) != null) { "These coins are too small for this pool." }
+                require(CoinjoinTx.change(us.sumOf { it.value }, t.amount, t.feeRate, us.size, t.script, t.outputs) != null) { "These coins are too small for this pool." }
                 val s = recheck(b)
                 coinjoin.join(s, pw, us, t, b.optString("poolPassword"))
                 reply(ex, 200, ok())
@@ -633,7 +635,8 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
                     if (c != null) {
                         require(c.optLong("amount") in Protocol.MIN_AMOUNT..Protocol.MAX_AMOUNT && c.optDouble("feeRate") in 1.0..500.0 &&
                             c.optInt("maxPeers") in Protocol.MIN_PEERS..Protocol.MAX_PEERS && c.optInt("minPeers") in Protocol.MIN_PEERS..c.optInt("maxPeers") &&
-                            c.optInt("hours") in 1..72 && c.optInt("maxInputs", 1) in 1..Protocol.MAX_INPUTS) { "Check the pool's settings." }
+                            c.optInt("hours") in 1..72 && c.optInt("maxInputs", 1) in 1..Protocol.MAX_INPUTS &&
+                            c.optInt("outputs", 1) in 1..Protocol.MAX_OUTPUTS) { "Check the pool's settings." }
                     }
                     coinjoin.expectExact(address, Coinjoin.AfterExact(t, i, b.getLong("exact"),
                         after.optString("pool").ifEmpty { null }, after.optString("poolPassword").ifEmpty { null }, c))
@@ -655,8 +658,9 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
     private fun termsJson(t: Protocol.Terms) = JSONObject()
         .put("id", t.id).put("amount", t.amount).put("feeRate", t.feeRate).put("peers", t.peers)
         .put("minPeers", t.minPeers).put("maxPeers", t.maxPeers).put("expiresAt", t.expiresAt).put("private", t.private)
-        .put("feeWithChange", CoinjoinTx.feeShare(t.feeRate, true, 1, t.script)).put("feeNoChange", CoinjoinTx.feeShare(t.feeRate, false, 1, t.script))
-        .put("script", Protocol.scriptName(t.script)).put("maxInputs", t.maxInputs).put("version", t.version)
+        .put("feeWithChange", CoinjoinTx.feeShare(t.feeRate, true, 1, t.script, t.outputs))
+        .put("feeNoChange", CoinjoinTx.feeShare(t.feeRate, false, 1, t.script, t.outputs))
+        .put("script", Protocol.scriptName(t.script)).put("maxInputs", t.maxInputs).put("version", t.version).put("outputs", t.outputs)
         .put("joinable", walletFor(t.script) != null)
 
     private fun coinjoinJson(w: NodeWallet): JSONObject {
@@ -687,7 +691,7 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
     private fun stateJson(st: PoolSession.State): JSONObject {
         val plan = runCatching { coinjoin.session(st.poolId).plan() }.getOrNull()
         val people = if (st.round.isNotEmpty()) st.round.size else st.seats.size
-        return JSONObject().put("id", st.poolId).put("amount", st.terms.amount).put("feeRate", st.terms.feeRate)
+        return JSONObject().put("id", st.poolId).put("amount", st.terms.amount).put("feeRate", st.terms.feeRate).put("outputs", st.terms.outputs)
             .put("creator", st.creator).put("private", st.terms.private).put("phase", st.phase.name).put("reason", st.reason)
             .put("people", people).put("minPeers", st.terms.minPeers).put("maxPeers", st.terms.maxPeers)
             .put("expiresAt", st.terms.expiresAt).put("phaseDeadline", st.phaseDeadline).put("voteDeadline", st.voteDeadline)
