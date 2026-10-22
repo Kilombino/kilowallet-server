@@ -167,6 +167,27 @@ class NodeWallet(private val dir: File, private val rpc: Rpc, accountKey: String
         }.sortedWith(compareBy({ it.confirmations > 0 }, { if (it.confirmations > 0) it.confirmations.toLong() else -it.time }))
     }
 
+    /** Receive index by scriptPubKey (hex): addresses come back with the node's network prefix. */
+    private val receiveIndex: Map<String, Int> by lazy { (0..RANGE).associateBy { script(0, it).toHex() } }
+
+    /**
+     * Receive indexes that ever got anything (spent since or not), as the node's wallet saw them
+     * from its rescan start: what must never be handed out again.
+     */
+    fun usedReceive(): Set<Int> {
+        // listreceivedbyaddress only knows the address book; an imported descriptor's addresses
+        // are not in it. Every payment that ever reached one shows in listtransactions.
+        val r = rpc.call("listtransactions", "*", 1_000_000, 0, true, timeoutMs = 600_000, wallet = name) as JSONArray
+        return (0 until r.length()).mapNotNull { k ->
+            val e = r.getJSONObject(k)
+            if (e.optString("category") !in setOf("receive", "generate", "immature")) return@mapNotNull null
+            val a = e.optString("address")
+            val sw = com.kilombino.pyblockwatch.crypto.Bech32.decodeSegwit(a.substring(0, a.lastIndexOf('1').coerceAtLeast(0)), a) ?: return@mapNotNull null
+            val op = if (sw.witnessVersion == 0) 0x00 else 0x50 + sw.witnessVersion
+            receiveIndex[(byteArrayOf(op.toByte(), sw.program.size.toByte()) + sw.program).toHex()]
+        }.toSet()
+    }
+
     fun rawTx(txid: String): String = rpc.call("getrawtransaction", txid) as String
     fun broadcast(hex: String): String = rpc.call("sendrawtransaction", hex) as String
 

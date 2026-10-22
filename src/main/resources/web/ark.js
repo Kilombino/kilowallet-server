@@ -124,7 +124,7 @@ function arkBalance(st) {
       h('button', { class: 'link', onclick: () => { S.street = !S.street; render(); } }, S.street ? '👁 show' : '🙈 hide')),
     h('div', { class: 'big' }, street(sats(total))), h('div', { class: 'faint' }, S.street ? 'STREET MODE' : 'sats'),
     h('div', { class: 'between' }, h('span', { class: 'mid' }, street(fiat(total))),
-      h('span', {}, ...['USD', 'EUR'].map(f => h('button', { class: 'link' + (S.fiat === f ? '' : ' faint'), onclick: () => { S.fiat = f; localStorage.setItem('kw.fiat', f); render(); } }, f)))),
+      fiatPicker()),
     b.pendingBoard ? h('div', { class: 'warnc small' }, 'entering Ark: ' + street(sats(b.pendingBoard) + ' sats') + ' · ' + boardConfText(st)) : null,
     b.pendingRound ? h('div', { class: 'warnc small' }, 'in the next round: ' + street(sats(b.pendingRound) + ' sats')) : null,
     h('div', { class: 'mt' }),
@@ -182,6 +182,7 @@ function arkReceive(st) {
         K.shown = null; render();
         get('Creating a new Lightning invoice… It can take a minute while the wallet finishes other work.', 'ark/invoice', { amount: n }, r => show(`Lightning invoice (${n} sats)`, r.invoice, { invoice: true }));
       } }, '⚡ INVOICE')),
+    fiatBox(amount, () => quote()),
     est,
     h('p', { class: 'faint small' }, `Lightning: up to ${sats(st.limits.maxLightning)} sats per payment. Deposits become Ark funds with MOVE INTO ARK (minimum ${sats(st.limits.minBoard)} sats).`),
     sh ? h('div', { class: 'mt' }, h('div', { class: 'label' }, sh.label),
@@ -237,7 +238,7 @@ function arkSend(st) {
     f.fromDeposit ? h('p', { class: 'faint small' }, 'Plain on-chain XBT to an XBT address. Only the network fee; no Ark reserves.') : null,
     h('div', { class: 'row' }, h('div', { class: 'grow' }, to), scan),
     h('div', { class: 'row' }, h('button', { class: 'link', onclick: async () => { try { f.to = scannedDestination(await navigator.clipboard.readText()); to.value = f.to; reset(); } catch { toast('Paste it into the box.'); } } }, 'PASTE'), pick),
-    amount];
+    amount, fiatBox(amount, v => { f.amount = v; reset(); })];
   const r = f.review;
   if (!r) parts.push(h('div', { class: 'btns' }, h('button', { class: 'primary', onclick: () => {
     if (!f.to) return toast('Type where to send.');

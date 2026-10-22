@@ -31,6 +31,7 @@ sourceSets {
             include("com/kilombino/pyblockwatch/coinjoin/PoolSession.kt")
             include("com/kilombino/pyblockwatch/coinjoin/Protocol.kt")
             include("com/kilombino/pyblockwatch/coinjoin/RelayClient.kt")
+            include("com/kilombino/pyblockwatch/data/JoinMarket.kt")
         }
     }
 }

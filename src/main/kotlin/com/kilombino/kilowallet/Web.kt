@@ -52,6 +52,14 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
     @Volatile private var market: JSONObject? = null
     /** Coinjoin rounds of this wallet (the app's COINJOIN tab). */
     val coinjoin = Coinjoin(dir, rpc) { wallets() }
+    /** Other wallets a coinjoin's mixed outputs can go to (watch-only, Jam's Apricot). */
+    val destinations = Destinations(dir, rpc).also { d ->
+        coinjoin.destScripts = { id, type, n ->
+            val dest = d.get(id)
+            require(dest.type == type) { "${dest.label} has no addresses of this pool's type." }
+            d.scripts(dest, n, coinjoin.heldScripts())
+        }
+    }
     /** Open pools as last listed, so a join is checked against what the user saw. */
     @Volatile private var pools: List<Protocol.Terms> = emptyList()
     /** Mixed-coin warnings of the open reviews, by draft id. */
@@ -63,8 +71,9 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
      * known to be the BLAKE2b chain nothing touches the node's wallets: no watch-only wallet is
      * created or loaded, nothing is scanned or sent, coinjoin rounds wait.
      */
-    @Volatile private var chain: ChainCheck.Result =
-        if (NodeWallet.testnet) ChainCheck.Result(ChainCheck.State.SKIPPED) else ChainCheck.Result(ChainCheck.State.UNREACHABLE, detail = "not checked yet")
+    // Not known until the first check (a moment after start), test networks too: that first check
+    // is what opens the wallet and starts the coinjoin rounds after a restart.
+    @Volatile private var chain: ChainCheck.Result = ChainCheck.Result(ChainCheck.State.UNREACHABLE, detail = "not checked yet")
     @Volatile private var nodeWorkStarted = false
 
     init {
@@ -288,6 +297,18 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
                     if (b.has("explorer")) c.put("explorer", b.getString("explorer").trimEnd('/'))
                 }
                 reply(ex, 200, settingsJson())
+            }
+            "/api/destinations" -> reply(ex, 200, destinationsJson())
+            "/api/destinations/add" -> {
+                recheck(b)
+                val since = if (b.isNull("since") || !b.has("since")) null else b.getLong("since")
+                destinations.add(b.getString("text"), b.optString("label"), b.optBoolean("taproot"), since)
+                reply(ex, 200, destinationsJson())
+            }
+            "/api/destinations/remove" -> {
+                val id = b.getString("id")
+                require(coinjoin.live().none { coinjoin.destOf(it.poolId) == id }) { "A round still going sends its mixed outputs there: wait for it first." }
+                destinations.remove(id); reply(ex, 200, destinationsJson())
             }
             "/api/secret/words" -> {
                 require(mode() == "hot") { "A watch-only wallet has no words." }
@@ -601,7 +622,10 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
                 require(us.size <= maxInputs) { "At most $maxInputs coin(s) per person in this pool." }
                 require(CoinjoinTx.change(us.sumOf { it.value }, amount, rate, us.size, pw.type, outputs) != null) { "These coins are too small for this pool." }
                 val s = recheck(b)
-                val st = coinjoin.create(s, pw, us, amount, rate, minPeers, maxPeers, hours, b.optString("poolPassword"), maxInputs, outputs)
+                val dest = b.optString("dest").ifEmpty { null }
+                val mixes = dest?.let { coinjoin.destScripts!!(it, pw.type, outputs) }
+                val st = coinjoin.create(s, pw, us, amount, rate, minPeers, maxPeers, hours, b.optString("poolPassword"), maxInputs, outputs, mixes)
+                dest?.let { coinjoin.rememberDest(st.poolId, it) }
                 reply(ex, 200, JSONObject().put("pool", st.poolId))
             }
             "/api/coinjoin/join" -> {
@@ -614,7 +638,10 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
                 val us = cjCoins(pw, b)
                 require(CoinjoinTx.change(us.sumOf { it.value }, t.amount, t.feeRate, us.size, t.script, t.outputs) != null) { "These coins are too small for this pool." }
                 val s = recheck(b)
-                coinjoin.join(s, pw, us, t, b.optString("poolPassword"))
+                val dest = b.optString("dest").ifEmpty { null }
+                val mixes = dest?.let { coinjoin.destScripts!!(it, pw.type, t.outputs) }
+                coinjoin.join(s, pw, us, t, b.optString("poolPassword"), mixes)
+                dest?.let { coinjoin.rememberDest(t.id, it) }
                 reply(ex, 200, ok())
             }
             "/api/coinjoin/close" -> { coinjoin.session(b.getString("pool")).requestClose(); reply(ex, 200, ok()) }
@@ -638,8 +665,10 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
                             c.optInt("hours") in 1..72 && c.optInt("maxInputs", 1) in 1..Protocol.MAX_INPUTS &&
                             c.optInt("outputs", 1) in 1..Protocol.MAX_OUTPUTS) { "Check the pool's settings." }
                     }
+                    val dest = b.optString("dest").ifEmpty { null }
+                    dest?.let { require(destinations.get(it).type == t) { "That destination has no addresses of this pool's type." } }
                     coinjoin.expectExact(address, Coinjoin.AfterExact(t, i, b.getLong("exact"),
-                        after.optString("pool").ifEmpty { null }, after.optString("poolPassword").ifEmpty { null }, c))
+                        after.optString("pool").ifEmpty { null }, after.optString("poolPassword").ifEmpty { null }, c, dest = dest))
                 }
                 reply(ex, 200, JSONObject().put("index", i).put("address", address))
             }
@@ -669,6 +698,7 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
             .put("script", Protocol.scriptName(if (type() == ScriptType.P2TR) ScriptType.P2TR else ScriptType.P2WPKH))
             .put("taproot", walletFor(ScriptType.P2TR) != null).put("segwit", walletFor(ScriptType.P2WPKH) != null)
             .put("maxInputs", Protocol.MAX_INPUTS)
+            .put("destinations", destinationsJson())
             .put("unlockedForAutoSign", secret != null)
             .put("waitingExact", JSONArray(coinjoin.waitingExact().map { JSONObject().put("value", it.value).put("create", it.create != null) }))
             .put("limits", JSONObject().put("minAmount", Protocol.MIN_AMOUNT).put("maxAmount", Protocol.MAX_AMOUNT)
@@ -697,6 +727,7 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
             .put("expiresAt", st.terms.expiresAt).put("phaseDeadline", st.phaseDeadline).put("voteDeadline", st.voteDeadline)
             .put("coinValue", st.seat.inputValue).put("coins", st.seat.coins.size).put("change", st.seat.changeValue)
             .put("script", Protocol.scriptName(st.terms.script))
+            .put("dest", coinjoin.destOf(st.poolId)?.let { id -> destinations.list().firstOrNull { it.id == id }?.label } ?: JSONObject.NULL)
             .put("iAsked", st.voteBy != null && st.voteBy == st.token?.let { Protocol.tokenHash(it) })
             .put("voted", st.votedOn != null && st.votedOn == st.voteId)
             .put("signed", st.postedSig).put("sigs", st.sigs.size).put("txid", st.txid ?: "")
@@ -838,9 +869,14 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
             .put("accountKey", cfg().optString("accountKey"))
             .put("settings", settingsJson())
             .put("contacts", cfg().optJSONArray("contacts") ?: JSONArray())
-        market?.let { m -> o.put("price", JSONObject().put("usd", m.optDouble("xbtUsd")).put("eur", m.optDouble("xbtEur"))) }
+        market?.let { m -> o.put("price", JSONObject().put("usd", m.optDouble("xbtUsd")).put("eur", m.optDouble("xbtEur"))
+            .put("perUsd", m.optJSONObject("fiatPerUsd") ?: JSONObject())) }
         return o
     }
 
-    companion object { const val VERSION = "0.6.0" }
+    private fun destinationsJson(): JSONArray = JSONArray(destinations.list().map { d ->
+        d.public().put("scanning", destinations.scanning(d))
+    })
+
+    companion object { const val VERSION = "0.7.0" }
 }

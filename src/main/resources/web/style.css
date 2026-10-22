@@ -52,3 +52,4 @@ pre.log { white-space:pre-wrap; max-height:60vh; overflow:auto; background:#0502
 .steps .bar { flex:1; height:2px; background:var(--line); }
 .steps .bar.done { background:var(--good); }
 .cjtabs button { white-space:nowrap; font-size:12px; padding:10px 2px; }
+select.fiatsel { width:auto; background:none; border:none; color:var(--faint); padding:6px 4px; font:inherit; } select.fiatsel.on { color:var(--purple); }

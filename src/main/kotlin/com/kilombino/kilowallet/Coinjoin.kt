@@ -171,39 +171,48 @@ class Coinjoin(private val dir: File, private val rpc: Rpc, private val walletPr
      * The coins with their keys (each checked against the watch-only key), and fresh scripts: one
      * per mixed output the pool gives each person (several in Kilojoin v4), and the change.
      */
-    private fun pick(secret: Vault.Secret, w: NodeWallet, us: List<NodeWallet.Utxo>, outputs: Int): Pick {
+    private fun pick(secret: Vault.Secret, w: NodeWallet, us: List<NodeWallet.Utxo>, outputs: Int, mixes: List<ByteArray>? = null): Pick {
         val master = Spend.master(secret)
         val paths = us.map { coinPath(w, it) }
-        return pickNodes(w, us, paths.map { Bip32Priv.derivePath(master, it) }, paths, outputs)
+        return pickNodes(w, us, paths.map { Bip32Priv.derivePath(master, it) }, paths, outputs, mixes)
     }
 
-    private fun pickNodes(w: NodeWallet, us: List<NodeWallet.Utxo>, nodes: List<Bip32Priv.ExtendedPrivKey>, paths: List<String>, outputs: Int): Pick {
+    /**
+     * [mixesTo]: the mixed outputs' scripts when they go to another wallet (a destination); null
+     * for fresh addresses of this one. The change always stays here.
+     */
+    private fun pickNodes(w: NodeWallet, us: List<NodeWallet.Utxo>, nodes: List<Bip32Priv.ExtendedPrivKey>, paths: List<String>, outputs: Int,
+                          mixesTo: List<ByteArray>? = null): Pick {
         require(w.type == ScriptType.P2WPKH || w.type == ScriptType.P2TR) { "Coinjoin needs a native SegWit (bc1q) or Taproot (bc1p) wallet." }
         require(us.isNotEmpty()) { "Pick a coin." }
         us.indices.forEach { require(nodes[it].publicKey().contentEquals(w.pubkey(us[it].branch, us[it].index))) { "These words do not match this wallet's key." } }
         val coins = us.indices.map { CoinjoinTx.Coin(us[it].txid, us[it].vout, us[it].value, nodes[it].publicKey(), w.type) }
-        val mixes = (0 until outputs).map { w.reserveReceive().second }
+        val mixes = mixesTo?.also { m ->
+            require(m.size == outputs) { "This pool gives $outputs mixed outputs each." }
+            require(m.all { CoinjoinTx.isType(it, w.type) }) { "That destination's addresses are not of this pool's type." }
+        } ?: (0 until outputs).map { w.reserveReceive().second }
         val change = w.freshChange().second
         return Pick(coins, nodes.map { it.key }, paths, mixes, change)
     }
 
     fun create(secret: Vault.Secret, w: NodeWallet, us: List<NodeWallet.Utxo>, amount: Long, feeRate: Double, minPeers: Int, maxPeers: Int,
-               hours: Int, password: String?, maxInputs: Int = 1, outputs: Int = 1): PoolSession.State {
+               hours: Int, password: String?, maxInputs: Int = 1, outputs: Int = 1, mixes: List<ByteArray>? = null): PoolSession.State {
         // Kilojoin v3 (blind outputs), like the app since 1.1.5; v4 with several outputs each (1.2.0).
         val np = PoolSession.newPool(amount, feeRate, maxPeers, hours, minPeers, !password.isNullOrEmpty(), w.type, maxInputs, v3 = true,
             outputs = outputs)
-        return createWith(pick(secret, w, us, outputs), np, password)
+        return createWith(pick(secret, w, us, outputs, mixes), np, password)
     }
 
     private fun createWith(p: Pick, np: PoolSession.Companion.NewPool, password: String?): PoolSession.State =
         add(PoolSession.newState(np.terms, true, np.secret, p.coins, p.keys, p.paths, p.mixes, p.change, password?.ifEmpty { null },
             np.creatorSecret, np.blindPriv), p.keys).state
 
-    fun join(secret: Vault.Secret, w: NodeWallet, us: List<NodeWallet.Utxo>, terms: Protocol.Terms, password: String?): PoolSession.State {
+    fun join(secret: Vault.Secret, w: NodeWallet, us: List<NodeWallet.Utxo>, terms: Protocol.Terms, password: String?,
+             mixes: List<ByteArray>? = null): PoolSession.State {
         require(terms.id !in sessions.keys || sessions[terms.id]!!.done) { "You are already in this pool." }
         require(terms.script == w.type) { "This pool takes ${if (terms.script == ScriptType.P2TR) "Taproot (bc1p)" else "native SegWit (bc1q)"} coins only, and this wallet's are not." }
         require(us.size <= terms.maxInputs) { "This pool takes at most ${terms.maxInputs} coin(s) per person." }
-        return joinWith(pick(secret, w, us, terms.outputs), w, terms, password)
+        return joinWith(pick(secret, w, us, terms.outputs, mixes), w, terms, password)
     }
 
     private fun joinWith(p: Pick, w: NodeWallet, terms: Protocol.Terms, password: String?): PoolSession.State {
@@ -222,13 +231,33 @@ class Coinjoin(private val dir: File, private val rpc: Rpc, private val walletPr
      * the coin waits among the others for a join by hand.
      */
     class AfterExact(val type: ScriptType, val index: Int, val value: Long, val poolId: String?, val poolPassword: String?,
-                     val create: JSONObject?, val since: Long = System.currentTimeMillis() / 1000) {
+                     val create: JSONObject?, val since: Long = System.currentTimeMillis() / 1000,
+                     /** A destination's id when the mixed outputs go to another wallet. */
+                     val dest: String? = null) {
         @Volatile var node: Bip32Priv.ExtendedPrivKey? = null
         @Volatile var path: String? = null
     }
     private val afterExact = ConcurrentHashMap<String, AfterExact>()  // by address
 
     fun expectExact(address: String, a: AfterExact) { afterExact[address] = a }
+
+    /** Unused scripts of a destination (id, pool type, how many): set by the server. */
+    @Volatile var destScripts: ((String, ScriptType, Int) -> List<ByteArray>)? = null
+
+    /** Mixed-output scripts seats still count on: rounds not over, or over after we posted ours. */
+    fun heldScripts(): Set<String> = sessions.values.map { it.state }.filter { st ->
+        val ended = st.phase == PoolSession.Phase.ABORTED || st.phase == PoolSession.Phase.REJECTED
+        !(ended && !st.postedOutput)
+    }.flatMap { it.mixScripts.map { m -> m.toHex() } }.toSet()
+
+    private val destFile = File(dir, "coinjoin-dest.json")
+    /** Which destination a pool's mixed outputs go to (only when not this wallet), for its card. */
+    @Synchronized fun rememberDest(poolId: String, destId: String) {
+        val o = if (destFile.exists()) runCatching { JSONObject(destFile.readText()) }.getOrDefault(JSONObject()) else JSONObject()
+        o.put(poolId, destId); destFile.writeText(o.toString())
+    }
+    @Synchronized fun destOf(poolId: String): String? =
+        if (destFile.exists()) runCatching { JSONObject(destFile.readText()).optString(poolId).ifEmpty { null } }.getOrNull() else null
     fun waitingExact(): List<AfterExact> = afterExact.values.filter { it.node != null }
 
     /** The payment of [amount] to [address] was signed with [secret]: keep that coin's key for its pool. */
@@ -251,8 +280,9 @@ class Coinjoin(private val dir: File, private val rpc: Rpc, private val walletPr
             runCatching {
                 val c = a.create
                 val outputs = c?.optInt("outputs", 1) ?: (fetchPools().firstOrNull { it.id == a.poolId }?.outputs ?: 1)
-                val p = pickNodes(w, listOf(u), listOf(node), listOf(a.path!!), outputs)
-                if (c != null) {
+                val p = pickNodes(w, listOf(u), listOf(node), listOf(a.path!!), outputs,
+                    a.dest?.let { d -> (destScripts ?: error("no destinations here"))(d, w.type, outputs) })
+                val st = if (c != null) {
                     val np = PoolSession.newPool(c.getLong("amount"), c.getDouble("feeRate"), c.getInt("maxPeers"), c.getInt("hours"),
                         c.getInt("minPeers"), c.optString("poolPassword").isNotEmpty(), w.type, c.optInt("maxInputs", 1), v3 = true,
                         outputs = outputs)
@@ -261,6 +291,8 @@ class Coinjoin(private val dir: File, private val rpc: Rpc, private val walletPr
                     val t = fetchPools().firstOrNull { it.id == a.poolId } ?: error("that pool is no longer open")
                     joinWith(p, w, t, a.poolPassword)
                 }
+                a.dest?.let { rememberDest(st.poolId, it) }
+                st
             }.onSuccess { emit("Coinjoin: perfect coin in", "${sats(a.value)} sats confirmed: " + (if (a.create != null) "pool opened" else "asked to join") + " on its own", it.poolId) }
              .onFailure { emit("Coinjoin: perfect coin ready", "${sats(a.value)} sats confirmed, but ${it.message}. Join a pool with it.", null) }
         }

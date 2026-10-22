@@ -40,10 +40,60 @@ function qr(text) {
   return h('div', { class: 'qr' }, h('img', { src: q.createDataURL(8, 0), alt: 'QR' }));
 }
 async function copy(t) { try { await navigator.clipboard.writeText(t); toast('Copied.'); } catch { toast('Could not copy: select it by hand.'); } }
-function fiat(n) {
-  const p = S.w && S.w.price; if (!p) return '≈ –';
-  const px = S.fiat === 'EUR' ? p.eur : p.usd; if (!px) return '≈ –';
-  return '≈ ' + (S.fiat === 'EUR' ? '€' : '$') + (n * px / 1e8).toLocaleString(undefined, { maximumFractionDigits: 2 });
+// The currencies the app offers: code, symbol before the number (or the code after it), decimals.
+const FIATS = [['USD', '$', 2], ['EUR', '€', 2], ['GBP', '£', 2], ['JPY', '¥', 0], ['CHF', null, 2], ['CNY', 'CN¥', 2], ['RON', null, 2],
+  ['PLN', null, 2], ['CZK', null, 2], ['HUF', null, 0], ['SEK', null, 2], ['NOK', null, 2], ['DKK', null, 2], ['ISK', null, 0], ['TRY', '₺', 2],
+  ['CAD', 'CA$', 2], ['AUD', 'A$', 2], ['NZD', 'NZ$', 2], ['BRL', 'R$', 2], ['MXN', 'MX$', 2], ['ARS', null, 2], ['CLP', null, 0], ['COP', null, 0],
+  ['PEN', null, 2], ['UYU', null, 2], ['VES', null, 2], ['INR', '₹', 2], ['KRW', '₩', 0], ['HKD', 'HK$', 2], ['SGD', 'S$', 2], ['ZAR', null, 2],
+  ['ILS', '₪', 2], ['THB', null, 2], ['IDR', null, 0], ['PHP', '₱', 2], ['MYR', null, 2]];
+function fiatInfo(code) { const f = FIATS.find(x => x[0] === code) || [code, null, 2]; return { code: f[0], sym: f[1], dec: f[2] }; }
+/** One XBT in [code] (rates from mempool.kilombino.com), or null without a price. */
+function perCoin(code) {
+  const p = S.w && S.w.price; if (!p || !p.usd) return null;
+  if (code === 'USD') return p.usd;
+  if (code === 'EUR' && p.eur) return p.eur;
+  const r = p.perUsd && p.perUsd[code]; return r ? p.usd * r : null;
+}
+function fmtFiat(v, code) {
+  const f = fiatInfo(code);
+  const n = v.toLocaleString('en-US', { minimumFractionDigits: f.dec, maximumFractionDigits: f.dec });
+  return f.sym ? f.sym + n : n + ' ' + f.code;
+}
+function fiat(n) { const px = perCoin(S.fiat); return px == null ? '≈ –' : '≈ ' + fmtFiat(n * px / 1e8, S.fiat); }
+function setFiat(f) { S.fiat = f; localStorage.setItem('kw.fiat', f); render(); }
+/** USD and EUR at hand, every other currency with a rate behind ▾: one choice for the whole page. */
+function fiatPicker() {
+  const p = S.w && S.w.price;
+  const avail = FIATS.filter(f => f[0] === 'USD' || f[0] === 'EUR' || (p && p.perUsd && p.perUsd[f[0]]));
+  const other = S.fiat !== 'USD' && S.fiat !== 'EUR';
+  return h('span', {}, ['USD', 'EUR'].map(f => h('button', { class: 'link' + (S.fiat === f ? '' : ' faint'), onclick: () => setFiat(f) }, f)),
+    h('select', { class: 'fiatsel' + (other ? ' on' : ''), onchange: e => { if (e.target.value) setFiat(e.target.value); } },
+      h('option', { value: '' }, other ? S.fiat + ' ▾' : '▾'), avail.map(f => h('option', { value: f[0] }, f[0] + (f[1] ? '  ' + f[1] : '')))));
+}
+/** A typed amount: "12.5", "12,5", "1,234.56" or "1.234,56". Null if it is not a number. */
+function parseFiat(text) {
+  const t = String(text).trim().replace(/\s/g, ''); if (!t) return null;
+  const dot = t.lastIndexOf('.'), comma = t.lastIndexOf(',');
+  let n = t;
+  if (dot >= 0 && comma >= 0) n = dot > comma ? t.replace(/,/g, '') : t.replace(/\./g, '').replace(',', '.');
+  else if (comma >= 0) n = (t.split(',').length === 2) ? t.replace(',', '.') : t.replace(/,/g, '');
+  else if (t.split('.').length > 2) n = t.replace(/\./g, '');
+  const v = Number(n); return isFinite(v) && v >= 0 ? v : null;
+}
+/**
+ * A box in the chosen currency bound to a sats box: typing in either fills the other.
+ * [onSats] gets the sats worked out from the currency.
+ */
+function fiatBox(satsInput, onSats) {
+  const px = perCoin(S.fiat), dec = fiatInfo(S.fiat).dec;
+  const box = h('input', { placeholder: '≈ ' + S.fiat + (px == null ? ' (no price yet)' : ''), inputmode: 'decimal', disabled: px == null });
+  const fromSats = () => { const v = Number(satsInput.value || 0); box.value = v > 0 && px ? (v * px / 1e8).toFixed(dec) : ''; };
+  satsInput.addEventListener('input', fromSats); fromSats();
+  box.addEventListener('input', () => {
+    const v = parseFiat(box.value); const s = v == null || !px ? '' : String(Math.round(v / px * 1e8));
+    satsInput.value = s; onSats(s);
+  });
+  return box;
 }
 
 // ------------------------------------------------------------------ boot
@@ -171,7 +221,7 @@ function mainView() {
         h('button', { class: 'link', onclick: () => { S.street = !S.street; render(); } }, S.street ? '👁 show' : '🙈 hide')),
       h('div', { class: 'big' }, street(sats(total))), h('div', { class: 'faint' }, S.street ? 'STREET MODE' : 'sats'),
       h('div', { class: 'between' }, h('span', { class: 'mid' }, street(fiat(total))),
-        h('span', {}, ...['USD', 'EUR'].map(f => h('button', { class: 'link' + (S.fiat === f ? '' : ' faint'), onclick: () => { S.fiat = f; localStorage.setItem('kw.fiat', f); render(); } }, f)))),
+        fiatPicker()),
       w.pending ? h('div', { class: 'warnc small' }, 'unconfirmed: ' + street(sats(w.pending) + ' sats')) : null,
       h('div', { class: 'faint small' }, `height ${w.height || '–'} · node wallet ${w.node || ''}`)),
     h('div', { class: 'btns' },
@@ -200,13 +250,20 @@ function receivePanel() {
   const pickType = S.w.taproot ? h('div', { class: 'tabs' },
     h('button', { class: tr ? 'soft' : 'primary', onclick: () => { S.recvTr = false; render(); } }, 'bc1q · SegWit'),
     h('button', { class: tr ? 'primary' : 'soft', onclick: () => { S.recvTr = true; render(); } }, 'bc1p · Taproot')) : null;
+  // An optional amount to ask for: the QR and COPY then carry a BIP-21 request.
+  const request = () => { const a = Number(S.recvAmt || 0); return a > 0 ? 'bitcoin:' + r.address + '?amount=' + (a / 1e8).toFixed(8).replace(/\.?0+$/, '') : r.address; };
+  const qrBox = h('div', {}, qr(request().startsWith('bitcoin:') ? request() : 'bitcoin:' + r.address));
+  const redraw = () => { const q = request(); qrBox.replaceChildren(qr(q.startsWith('bitcoin:') ? q : 'bitcoin:' + q)); };
+  const ask = h('input', { placeholder: 'amount to ask (sats, optional)', inputmode: 'numeric', value: S.recvAmt || '',
+    oninput: e => { e.target.value = e.target.value.replace(/\D/g, ''); S.recvAmt = e.target.value; redraw(); } });
   return h('div', { class: 'panel' },
     h('div', { class: 'between' }, h('div', { class: 'label' }, 'Receive'), h('button', { class: 'link faint', onclick: () => { S.sheet = null; render(); } }, 'close')),
     pickType,
-    qr('bitcoin:' + r.address), h('div', { class: 'mono center' }, r.address),
+    qrBox, h('div', { class: 'mono center' }, r.address),
     h('div', { class: 'faint small center' }, `unused · m/${tr ? 86 : 84}'/…/0/${r.index}`),
+    h('div', { class: 'row' }, h('div', { class: 'grow' }, ask), h('div', { class: 'grow' }, fiatBox(ask, v => { S.recvAmt = v; redraw(); }))),
     h('div', { class: 'btns' },
-      h('button', { class: 'soft', onclick: () => copy(r.address) }, 'COPY'),
+      h('button', { class: 'soft', onclick: () => copy(request()) }, 'COPY'),
       h('button', { class: 'soft', onclick: () => api('receive/next', { type: tr ? 'p2tr' : 'p2wpkh' }).then(n => { if (tr) S.w.receiveTr = n; else S.w.receive = n; render(); }).catch(e => toast(e.message)) }, 'NEXT ADDRESS')));
 }
 const typeTag = c => (S.w && S.w.taproot) ? (c.type === 'p2tr' ? ' · bc1p' : ' · bc1q') : '';
@@ -244,6 +301,7 @@ function sendForm() {
       pick),
     h('div', { class: 'row small faint' }, h('div', { class: 'grow' }, 'amount (sats)'), h('div', { class: 'w110' }, 'fee sat/vB')),
     h('div', { class: 'row' }, h('div', { class: 'grow' }, amount), h('div', { class: 'w110' }, rate)),
+    f.max ? null : h('div', { class: 'row' }, h('div', { class: 'grow' }, fiatBox(amount, v => f.amount = v)), h('div', { class: 'w110' })),
     h('label', { class: 'check small' }, h('input', { type: 'checkbox', checked: f.max, onchange: e => { f.max = e.target.checked; render(); } }), 'MAX: send everything (minus the fee)'),
     cc,
     h('div', { class: 'btns' }, h('button', { class: 'primary', onclick: () => api('send/prepare', {
@@ -325,12 +383,18 @@ function sentView() {
 
 function movementsPanel() {
   const txs = (S.w && S.w.transactions) || [];
-  return h('div', { class: 'panel' }, h('div', { class: 'label' }, 'Movements · confirmations'),
+  // Folded by default (the list only grows, and Coins sits under it); open or closed as left last time.
+  let open = false; try { open = localStorage.getItem('kw.movOpen') === '1'; } catch {}
+  const pending = txs.filter(t => !t.confirmations).length;
+  const d = h('details', { class: 'panel', open },
+    h('summary', { class: 'label' }, `Movements · confirmations (${txs.length})`, pending ? h('span', { class: 'warnc' }, ` · ${pending} in mempool`) : null),
     txs.length ? txs.map(t => h('div', { class: 'tx', onclick: () => txDetail(t) },
       h('div', { class: 'between' }, h('span', { class: t.net > 0 ? 'in' : 'out' }, street((t.net > 0 ? '+' : '') + sats(t.net) + ' sats')),
         h('span', { class: t.confirmations ? 'faint small' : 'warnc small' }, t.confirmations ? `${t.confirmations} conf${t.confirmations >= 6 ? '  ✓' : ''}` : 'in mempool · 0 conf')),
       h('div', { class: 'faint small' }, street(`(left: ${sats(t.left)} sats)`)),
       h('div', { class: 'faint small' }, t.txid.slice(0, 8) + '…' + t.txid.slice(-6)))) : h('p', { class: 'faint small' }, 'Nothing yet.'));
+  d.addEventListener('toggle', () => { try { localStorage.setItem('kw.movOpen', d.open ? '1' : '0'); } catch {} });
+  return d;
 }
 
 function coinsPanel() {
@@ -378,7 +442,7 @@ function settingsPanel() {
     h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: st.streetDefault !== false, onchange: e => set('streetDefault', e.target.checked) }),
       h('span', {}, 'Street mode', h('br'), h('span', { class: 'faint small' }, 'On: amounts hidden every time the page opens, until you tap the eye.'))),
     h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: st.prices !== false, onchange: e => set('prices', e.target.checked) }),
-      h('span', {}, 'USD/EUR prices', h('br'), h('span', { class: 'faint small' }, 'From mempool.kilombino.com (it sees this server asking, nothing about your wallet).'))),
+      h('span', {}, 'Prices in your currency', h('br'), h('span', { class: 'faint small' }, 'From mempool.kilombino.com (it sees this server asking, nothing about your wallet).'))),
     h('div', { class: 'soft small' }, 'Block explorer (where a movement opens)'), explorer,
     h('button', { class: 'link', onclick: () => set('explorer', explorer.value) }, 'SAVE EXPLORER'),
     h('details', {}, h('summary', { class: 'soft small' }, 'Account key (xpub/zpub)'),
@@ -515,7 +579,7 @@ function coinjoinView() {
   parts.push(h('div', { class: 'btns' }, h('button', { class: 'primary', onclick: () => {
     C.create = { amount: '100000', rate: '1', min: '2', max: '5', hours: '6', inputs: '5', outputs: '1', password: '', script: C.st.segwit === false ? 'p2tr' : 'p2wpkh' }; render();
   } }, '＋  OPEN A POOL')));
-  parts.push(openPools(mine), intro, autoSignPanel(), notificationsPanel(), howPanel());
+  parts.push(openPools(mine), intro, autoSignPanel(), destinationsPanel(), notificationsPanel(), howPanel());
   return h('div', {}, parts);
 }
 
@@ -596,12 +660,14 @@ function myPool(p, embedded) {
       p.phase === 'CONFIRMED' ? h('button', { class: 'link faint', onclick: () => cjAct('coinjoin/remove', { pool: p.id }) }, 'remove') : null));
   if (['ABORTED', 'REJECTED'].includes(p.phase)) acts.push(h('button', { class: 'link faint', onclick: () => cjAct('coinjoin/remove', { pool: p.id }) }, 'remove'));
   const coinLine = h('p', { class: 'faint small' }, `${p.coins > 1 ? 'your ' + p.coins + ' coins' : 'your coin'} ${sats(p.coinValue)} → ${amountOf(p.amount, p.outputs)} mixed${p.change > 0 ? ' + ' + sats(p.change) + ' change' : ''} · fee ${sats(p.coinValue - p.amount * (p.outputs || 1) - p.change)}`);
-  if (embedded) return h('div', { class: 'mt' }, coinLine, acts);
+  // Only on this server: where the mixed outputs go when it is not this wallet.
+  const destLine = p.dest ? h('p', { class: 'small', style: 'color:var(--purple)' }, 'mixed outputs go to: ' + p.dest) : null;
+  if (embedded) return h('div', { class: 'mt' }, coinLine, destLine, acts);
   return h('div', { class: 'panel' + (['VOTING', 'SIGNING'].includes(p.phase) ? ' warn' : ['ABORTED', 'REJECTED'].includes(p.phase) ? ' bad' : '') },
     h('div', { class: 'between' }, h('span', { class: 'mid' }, amountOf(p.amount, p.outputs) + ' sats' + (p.script === 'p2tr' ? ' · Taproot' : '')), h('span', { class: 'faint small' }, (p.private ? '🔒 ' : '') + (p.creator ? 'your pool' : 'joined'))),
     h('p', { class: cls + ' small' }, phaseText(p)),
     h('p', { class: 'faint small' }, `${p.coins > 1 ? 'your ' + p.coins + ' coins' : 'your coin'} ${sats(p.coinValue)} → ${amountOf(p.amount, p.outputs)} mixed${p.change > 0 ? ' + ' + sats(p.change) + ' change' : ''} · fee ${sats(p.coinValue - p.amount * (p.outputs || 1) - p.change)}`),
-    acts);
+    destLine, acts);
 }
 
 function openPools(mine) {
@@ -702,17 +768,24 @@ function coinPicker() {
   const total = coins.filter(c => C.chosen.includes(c.outpoint)).reduce((a, c) => a + c.value, 0);
   const ch = C.chosen.length ? cjChange(total, k.amount, k.rate, C.chosen.length, o) : null;
   const use = h('button', { class: 'primary', disabled: ch === null }, C.create ? 'OPEN POOL' : 'JOIN');
+  // Where the mixed outputs go: this wallet by default; another one only when set up and of the pool's type.
+  const dests = (C.st.destinations || []).filter(d => d.type === cjType() && !d.scanning);
+  if (!dests.some(d => d.id === C.dest)) C.dest = '';
+  const destPick = dests.length ? h('div', {}, h('div', { class: 'soft small mt' }, 'Mixed outputs go to'),
+    [{ id: '', label: 'This wallet (default)' }].concat(dests).map(d => h('label', { class: 'check small' },
+      h('input', { type: 'radio', name: 'cjdest', checked: C.dest === d.id, onchange: () => { C.dest = d.id; render(); } }), h('span', {}, d.label))),
+    C.dest ? h('p', { class: 'faint small' }, "Unused receive addresses of that wallet; the change, if any, comes back here. Nobody in the round can tell: an output is just an address of the pool's type.") : null) : null;
   const submit = async () => {
     use.disabled = true;
     try {
       if (C.create) {
         const f = C.create;
         await api('coinjoin/create', { coins: C.chosen, script: cjType(), maxInputs: maxIn, outputs: o, amount: k.amount, feeRate: k.rate, minPeers: Number(f.min), maxPeers: Number(f.max),
-          hours: Number(f.hours), poolPassword: f.password, password: pw.value });
+          hours: Number(f.hours), poolPassword: f.password, password: pw.value, dest: C.dest || '' });
         C.create = null; toast('Pool opened: others are told about it.');
       } else {
         if (C.join.pool.private && !C.join.password) { use.disabled = false; return toast('Type the pool\'s password first.'); }
-        await api('coinjoin/join', { pool: C.join.pool.id, coins: C.chosen, poolPassword: C.join.password, password: pw.value });
+        await api('coinjoin/join', { pool: C.join.pool.id, coins: C.chosen, poolPassword: C.join.password, password: pw.value, dest: C.dest || '' });
         C.join = null; toast('Asked to join: the creator\'s wallet lets you in.');
       }
       C.pick = null; C.chosen = [];
@@ -749,7 +822,12 @@ function coinPicker() {
   return h('div', { class: 'panel' }, h('div', { class: 'label' }, k.title),
     poolPw ? h('div', {}, h('p', { class: 'small soft' }, '🔒 Private pool: its creator shares the password with the people invited. Without it the pool refuses you.'), poolPw) : null,
     h('p', { class: 'small soft' }, `Only ${kindName(cjType())} coins can join this pool. Your other coins can still pay for an exact coin of this type.`),
-    h('p', { class: 'small soft' }, maxIn > 1
+    destPick,
+    C.dest ? h('p', { class: 'small soft' }, (maxIn > 1
+      ? `Tick up to ${maxIn} confirmed coins that together make at least ${sats(k.amount * o)} sats plus your fee. The leftover comes back to a fresh change address. `
+      : `Pick ONE confirmed coin of at least ${sats(exact)} sats. Its leftover comes back to a fresh change address. `) +
+      (o > 1 ? `Each of your ${o} mixed outputs of ${sats(k.amount)} sats goes to its own unused address of the wallet chosen above.` : 'The mixed output goes to an unused address of the wallet chosen above.'))
+    : h('p', { class: 'small soft' }, maxIn > 1
       ? `Tick up to ${maxIn} confirmed coins that together make at least ${sats(k.amount * o)} sats plus your fee. The leftover comes back to a fresh change address; ` +
         (o > 1 ? `each of your ${o} mixed outputs of ${sats(k.amount)} sats goes to its own fresh address of this wallet.` : 'the mixed output goes to another fresh address of this wallet.')
       : `Pick ONE confirmed coin of at least ${sats(exact)} sats. Its leftover comes back to a fresh change address; ` +
@@ -772,7 +850,7 @@ async function prepareExact(exact, script) {
     const after = C.create && C.pick ? { create: { amount: C.pick.amount, feeRate: C.pick.rate, minPeers: Number(C.create.min), maxPeers: Number(C.create.max),
         hours: Number(C.create.hours), poolPassword: C.create.password || '', maxInputs: C.pick.maxInputs || 1, outputs: C.pick.outputs || 1 } }
       : C.join ? { pool: C.join.pool.id, poolPassword: C.join.password || '' } : null;
-    const r = await api('coinjoin/exact', { script: script || 'p2wpkh', exact, after });
+    const r = await api('coinjoin/exact', { script: script || 'p2wpkh', exact, after, dest: C.dest || '' });
     const pool = (C.st.coins || []).filter(c => !c.inRound && !c.mixed && c.confirmations > 0).sort((a, b) => b.value - a.value);
     const pick = new Set(); let sum = 0;
     for (const c of pool) { if (sum >= exact + 500) break; pick.add(c.outpoint); sum += c.value; }
@@ -788,6 +866,26 @@ async function prepareExact(exact, script) {
 // ------------------------------------------------------------------ coinjoin: alerts
 
 function soundOn() { try { return localStorage.getItem('kw.cjSound') === '1'; } catch { return false; } }
+
+/** Other wallets a coinjoin's mixed outputs can go to: a watch-only wallet's key or Jam's export. */
+function destinationsPanel() {
+  const ds = C.st.destinations || [];
+  const text = h('textarea', { placeholder: 'zpub / xpub of a watch-only wallet, or Jam\'s export line (kilowallet-jm:v1:…)', rows: 2 });
+  const label = h('input', { placeholder: 'name (optional)', autocomplete: 'off' });
+  const taproot = h('input', { type: 'checkbox' });
+  const since = h('input', { type: 'date' });
+  const pw = h('input', { type: 'password', placeholder: 'password, to confirm', autocomplete: 'current-password' });
+  const add = () => api('destinations/add', { text: text.value.trim(), label: label.value, taproot: taproot.checked,
+      since: since.value ? Math.floor(new Date(since.value + 'T00:00:00Z').getTime() / 1000) : null, password: pw.value })
+    .then(r => { C.st.destinations = r; toast('Added. The node is looking through the chain for it: it can take a while.'); render(); }).catch(e => toast(e.message));
+  return h('details', { class: 'panel' }, h('summary', { class: 'label' }, '📤 Other wallets for mixed outputs'),
+    h('p', { class: 'small soft' }, 'A round\'s mixed outputs can go straight to another wallet of yours instead of this one: a watch-only wallet (its zpub, or a Taproot xpub) or your Jam wallet\'s first jar, Apricot (its "View in Kilowallet" line). The node keeps a watch-only copy of it, so only addresses that never received anything are used. Only output addresses ever leave this server.'),
+    ds.length ? ds.map(d => h('div', { class: 'between small' }, h('span', {}, d.label + ' · ' + (d.type === 'p2tr' ? 'bc1p' : 'bc1q') + (d.scanning ? ' · looking through the chain…' : '')),
+      h('button', { class: 'link faint', onclick: () => api('destinations/remove', { id: d.id }).then(r => { C.st.destinations = r; render(); }).catch(e => toast(e.message)) }, 'remove'))) : null,
+    text, label, h('label', { class: 'check small' }, taproot, 'Taproot (bc1p) watch-only wallet'),
+    h('div', { class: 'soft small mt' }, 'made around (the node looks back from that day, so every address it ever used is known)'), since,
+    pw, h('div', { class: 'btns' }, h('button', { class: 'soft', onclick: add }, 'ADD')));
+}
 
 function notificationsPanel() {
   const st = C.st.settings || {};
