@@ -25,3 +25,28 @@ class DestinationsTest {
         assertFailsWith<IllegalArgumentException> { Destinations.pickUnused(3, -1, held, ::s) }
     }
 }
+
+/** A watched key's address type: a zpub says it, a plain xpub must be told (as the app since 1.2.4). */
+class DestinationTypeTest {
+    @Test fun zpubIsNativeSegwit() {
+        assertEquals(com.kilombino.pyblockwatch.crypto.ScriptType.P2WPKH,
+            Destinations.typeOf(com.kilombino.pyblockwatch.crypto.ScriptType.P2WPKH, com.kilombino.pyblockwatch.crypto.ScriptType.P2TR))
+    }
+
+    @Test fun plainXpubNeedsItsType() {
+        val x = com.kilombino.pyblockwatch.crypto.ScriptType.P2PKH
+        assertFailsWith<IllegalStateException> { Destinations.typeOf(x, null) }
+        assertEquals(com.kilombino.pyblockwatch.crypto.ScriptType.P2TR, Destinations.typeOf(x, com.kilombino.pyblockwatch.crypto.ScriptType.P2TR))
+        assertFailsWith<IllegalStateException> { Destinations.typeOf(x, com.kilombino.pyblockwatch.crypto.ScriptType.P2SH_P2WPKH) }
+    }
+
+    @Test fun ypubRefused() {
+        assertFailsWith<IllegalStateException> { Destinations.typeOf(com.kilombino.pyblockwatch.crypto.ScriptType.P2SH_P2WPKH, null) }
+    }
+
+    @Test fun indexesMatchScripts() {
+        fun s(i: Int) = byteArrayOf(0, 20, i.toByte())
+        val held = setOf(s(5).toHex())
+        assertEquals(listOf(4, 6, 7), Destinations.pickUnusedIndexes(3, 3, held, ::s))
+    }
+}

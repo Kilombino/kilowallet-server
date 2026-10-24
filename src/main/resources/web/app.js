@@ -96,6 +96,39 @@ function fiatBox(satsInput, onSats) {
   return box;
 }
 
+/** A pasted extended public key's prefix and depth (no checksum check: only to know what to ask). */
+function xpubInfo(text) {
+  const t = String(text || '').replace(/\s/g, '');
+  if (!/^[xyzt]pub[1-9A-HJ-NP-Za-km-z]{100,}$/.test(t)) return null;
+  const A = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+  let n = 0n; for (const c of t) n = n * 58n + BigInt(A.indexOf(c));
+  const hex = n.toString(16).padStart(164, '0'); // 78 bytes + 4 of checksum
+  return { prefix: t.slice(0, 4), depth: parseInt(hex.slice(8, 10), 16) };
+}
+/**
+ * Under a pasted key (as the app since 1.2.4): a plain xpub doesn't say which addresses it makes,
+ * so its type is asked; a key that is not an account key (depth 3) is pointed out.
+ * [types]: the choices offered; [state.type] holds the pick.
+ */
+function xpubTypeChoice(state, types) {
+  const box = h('div', {});
+  const draw = () => {
+    const k = xpubInfo(state.text);
+    const kids = [];
+    if (k && k.depth !== 3) kids.push(h('p', { class: 'badc small' }, `This key is at depth ${k.depth}, not an account key (m/84'/0'/0', m/86'/0'/0'…): its addresses won't match your wallet's. Export the account xpub instead.`));
+    if (k && (k.prefix === 'xpub' || k.prefix === 'tpub')) {
+      kids.push(h('p', { class: 'soft small' }, "A plain xpub doesn't say which addresses it makes: pick the type your wallet uses."));
+      types.forEach(([v, name]) => kids.push(h('label', { class: 'check small' },
+        h('input', { type: 'radio', name: 'xpubtype' + (state.id || ''), checked: state.type === v, onchange: () => { state.type = v; } }), h('span', {}, name))));
+    } else state.type = '';
+    box.replaceChildren(...kids);
+  };
+  draw();
+  box.redraw = draw;
+  return box;
+}
+const XPUB_TYPES = [['p2wpkh', 'Native SegWit · bc1q… (BIP84)'], ['p2tr', 'Taproot · bc1p… (BIP86)'], ['p2sh-p2wpkh', 'Nested SegWit · 3… (BIP49)'], ['p2pkh', 'Legacy · 1… (BIP44)']];
+
 // ------------------------------------------------------------------ boot
 
 async function boot() {
@@ -154,8 +187,9 @@ function setupView() {
   const pw = h('input', { type: 'password', placeholder: 'password (8+ characters)', autocomplete: 'new-password' });
   const words = h('textarea', { placeholder: '12 or 24 recovery words' });
   const pass = h('input', { type: 'text', placeholder: 'BIP-39 passphrase (optional, usually empty)' });
-  const key = h('textarea', { placeholder: 'xpub / ypub / zpub' });
-  const taproot = h('input', { type: 'checkbox' });
+  const ks = { text: '', type: '', id: 'setup' };
+  const kType = xpubTypeChoice(ks, XPUB_TYPES);
+  const key = h('textarea', { placeholder: 'xpub / ypub / zpub', oninput: e => { ks.text = e.target.value; kType.redraw(); } });
   const since = h('input', { type: 'date' });
   const run = (path, body) => api(path, body).then(async r => {
     S.me = await api('state'); await loadWallet().catch(() => {});
@@ -181,8 +215,12 @@ function setupView() {
     h('div', { class: 'panel' },
       h('div', { class: 'label' }, 'Watch-only wallet'),
       h('p', { class: 'small soft' }, 'An extended PUBLIC key: balance, fresh addresses, movements. It holds no keys: to send, it hands a PSBT to a separate signer.'),
-      key, h('label', { class: 'check' }, taproot, 'Taproot (bc1p) account'),
-      h('div', { class: 'btns' }, h('button', { class: 'soft', onclick: () => run('setup/watch', { password: pw.value, key: key.value, taproot: taproot.checked, since: ts() }) }, 'WATCH IT'))));
+      key, kType,
+      h('div', { class: 'btns' }, h('button', { class: 'soft', onclick: () => {
+        const k = xpubInfo(key.value);
+        if (k && (k.prefix === 'xpub' || k.prefix === 'tpub') && !ks.type) return toast("Pick the address type of this xpub first.");
+        run('setup/watch', { password: pw.value, key: key.value, type: ks.type, since: ts() });
+      } }, 'WATCH IT'))));
 }
 
 function unlockView() {
@@ -204,13 +242,15 @@ function mainView() {
   const top = h('div', { class: 'between' },
     h('span', { class: 'pill' }, hot ? 'HOT WALLET' : 'WATCH-ONLY'),
     h('div', {},
-      h('button', { class: 'link', onclick: () => { S.showSettings = !S.showSettings; render(); } }, S.showSettings ? 'close' : 'settings'),
+      h('button', { class: 'link', onclick: () => toggleSettings() }, S.showSettings ? '✕ close' : '⚙ settings'),
       h('button', { class: 'link faint', onclick: () => api('lock', {}).then(() => { S.me.unlocked = false; S.w = null; render(); }) }, 'lock')));
   if (S.newWords) return h('div', {}, top, newWordsPanel());
+  // Settings open in place of the screen, from the top (as the app since 1.2.5): ✕ or back closes them.
+  if (S.showSettings && S.w && !S.w.error) return h('div', {}, top, settingsPanel());
   const tabs = h('div', { class: 'tabs mt' }, [['btc', 'BTC'], ['ark', 'ARK'], ['coinjoin', 'COINJOIN']].map(([k, label]) =>
     h('button', { class: S.tab === k ? 'on' : '', onclick: () => openTab(k) }, label)));
-  if (S.tab === 'coinjoin' && !w.error && !w.importing) return h('div', {}, top, tabs, S.showSettings ? settingsPanel() : null, coinjoinView());
-  if (S.tab === 'ark') return h('div', {}, top, tabs, S.showSettings && !w.error ? settingsPanel() : null, arkView());
+  if (S.tab === 'coinjoin' && !w.error && !w.importing) return h('div', {}, top, tabs, coinjoinView());
+  if (S.tab === 'ark') return h('div', {}, top, tabs, arkView());
   if (w.error) return h('div', {}, top, h('div', { class: 'panel bad' }, h('div', { class: 'label' }, 'Node'), h('p', {}, w.error)));
   if (w.importing) return h('div', {}, top, h('div', { class: 'panel' }, h('div', { class: 'label' }, 'Reading your history'),
     h('p', { class: 'soft' }, 'The node is looking through the chain for this wallet\'s coins and movements. It can take from a minute to a while; this page updates by itself.')));
@@ -229,7 +269,6 @@ function mainView() {
       h('button', { class: 'primary', onclick: () => { S.sheet = 'send'; S.draft = null; S.sent = null; S.psbt = null; render(); } }, 'SEND'))];
   if (S.sheet === 'receive') parts.push(receivePanel());
   if (S.sheet === 'send') parts.push(sendPanel());
-  if (S.showSettings) parts.push(settingsPanel());
   parts.push(movementsPanel(), coinsPanel());
   return h('div', {}, parts);
 }
@@ -317,13 +356,14 @@ function reviewView(d) {
   const pw = h('input', { type: 'password', placeholder: 'password, to sign', autocomplete: 'current-password' });
   const rows = [
     d.cpfpParent ? h('p', { class: 'small soft' }, 'Pulls the stuck payment along: a payment to yourself that spends what it brought you, with a fee big enough for both.') : null,
-    d.replaces ? h('p', { class: 'small soft' }, 'Replaces the stuck send with the same payment and a higher fee, taken from your change.') : null,
-    h('div', { class: 'between' }, h('span', { class: 'soft' }, d.cpfpParent ? 'Back to you' : 'To'), h('span', { class: 'mono' }, short(d.to))),
+    d.cancels ? h('p', { class: 'small warnc' }, 'Cancels the payment: the same coins go back to a fresh address of this wallet, paying a little more fee, so the recipients get nothing. If the payment confirms first, the cancellation is refused: the earlier, the better.')
+      : d.replaces ? h('p', { class: 'small soft' }, 'Replaces the stuck send with the same payment and a higher fee, taken from your change.') : null,
+    h('div', { class: 'between' }, h('span', { class: 'soft' }, d.cpfpParent || d.cancels ? 'Back to you' : 'To'), h('span', { class: 'mono' }, short(d.to))),
     h('div', { class: 'between' }, h('span', { class: 'soft' }, 'Amount'), h('span', {}, sats(d.amount) + ' sats')),
     h('div', { class: 'between' }, h('span', { class: 'soft' }, 'Fee'), h('span', {}, (d.replaces ? sats(d.replacedFee) + ' → ' : '') + sats(d.fee) + ' sats · ' +
       (d.cpfpParent ? d.packageRate.toFixed(1) + ' sat/vB both together' : d.rate.toFixed(1) + ' sat/vB'))),
     h('div', { class: 'between' }, h('span', { class: 'soft' }, 'Change'), h('span', {}, d.change && !d.cpfpParent ? sats(d.change) + ' sats' : '—')),
-    d.changeAddress && d.change && !d.cpfpParent ? h('div', { class: 'faint small', style: 'text-align:right' }, 'back to your address ' + short(d.changeAddress)) : null,
+    d.changeAddress && d.change && !d.cpfpParent ? h('div', { class: 'faint small right' }, 'back to your address ' + short(d.changeAddress)) : null,
     h('div', { class: 'between' }, h('span', { class: 'soft' }, 'Inputs'), h('span', {}, d.inputs)),
     h('p', { class: 'faint small' }, 'Signed with the unified sighash: valid only on BTC, it can\'t be replayed on the spamchain.'),
     d.concern ? h('div', {}, h('p', { class: 'badc small' }, '⚠ ' + d.concern + ' Check it before signing: a fee can\'t be taken back.'),
@@ -415,7 +455,7 @@ function txDetail(t) {
   const hot = S.me.mode === 'hot';
   const rate = h('input', { placeholder: 'sat/vB', inputmode: 'decimal', value: '3' });
   let m;
-  const speed = cpfp => api(cpfp ? 'cpfp' : 'bump', { txid: t.txid, rate: Number(rate.value.replace(',', '.')) })
+  const speed = (cpfp, cancel) => (toast('Preparing…'), api)(cancel ? 'cancel' : cpfp ? 'cpfp' : 'bump', { txid: t.txid, rate: Number(rate.value.replace(',', '.')) })
     .then(d => { m.remove(); S.sheet = 'send'; S.sent = null; S.psbt = null; S.draft = d; render(); window.scrollTo(0, 0); }).catch(e => toast(e.message));
   m = modal(h('div', { class: 'label' }, 'Transaction'),
     h('p', { class: t.confirmations ? 'soft' : 'warnc' }, t.confirmations ? `${t.confirmations} confirmation${t.confirmations === 1 ? '' : 's'}` : 'in mempool · 0 confirmations'),
@@ -425,11 +465,23 @@ function txDetail(t) {
     !t.confirmations ? h('div', {}, h('p', { class: 'small soft' }, t.net > 0
       ? 'Stuck? Pull it along (CPFP): choose the fee rate for it and the speed-up together.'
       : 'Stuck? Replace it (RBF) with the same payment at a higher fee rate.'), rate,
-      h('div', { class: 'btns' }, h('button', { class: 'primary', onclick: () => speed(t.net > 0) }, t.net > 0 ? '⚡ SPEED UP (CPFP)' : '⚡ SPEED UP (RBF)'))) : null,
+      h('div', { class: 'btns' }, h('button', { class: 'primary', onclick: () => speed(t.net > 0) }, t.net > 0 ? '⚡ SPEED UP (CPFP)' : '⚡ SPEED UP (RBF)'),
+        t.net < 0 ? h('button', { class: 'soft', onclick: () => speed(false, true) }, '✕ CANCEL') : null),
+      t.net < 0 ? h('p', { class: 'faint small' }, 'Sent by mistake? ✕ CANCEL sends the same coins back to a fresh address of this wallet, at least 1 sat/vB more than it paid, so the recipients get nothing.') : null) : null,
     h('div', { class: 'btns' }, h('button', { class: 'link faint', onclick: () => m.remove() }, 'close')));
 }
 
 // ------------------------------------------------------------------ settings
+
+/** Opening the settings is a step back can undo: the browser's back closes them. */
+function toggleSettings(open = !S.showSettings) {
+  if (open === S.showSettings) return;
+  S.showSettings = open;
+  if (open) { try { history.pushState({ kwSettings: true }, ''); } catch {} window.scrollTo(0, 0); }
+  else if (history.state && history.state.kwSettings) { try { history.back(); } catch {} }
+  render();
+}
+window.addEventListener('popstate', () => { if (S.showSettings) { S.showSettings = false; render(); } });
 
 function settingsPanel() {
   const st = S.w.settings || {};
@@ -438,7 +490,8 @@ function settingsPanel() {
   const pwBox = () => h('input', { type: 'password', placeholder: 'password' });
   const pw1 = pwBox(), pwNew = h('input', { type: 'password', placeholder: 'new password (8+)' }), pw2 = pwBox(), pw3 = pwBox();
   const hot = S.me.mode === 'hot';
-  return h('div', { class: 'panel' }, h('div', { class: 'label' }, 'Settings'),
+  return h('div', { class: 'panel' }, h('div', { class: 'between' }, h('div', { class: 'label' }, 'Settings'),
+      h('button', { class: 'link faint', onclick: () => toggleSettings(false) }, '✕')),
     h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: st.streetDefault !== false, onchange: e => set('streetDefault', e.target.checked) }),
       h('span', {}, 'Street mode', h('br'), h('span', { class: 'faint small' }, 'On: amounts hidden every time the page opens, until you tap the eye.'))),
     h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: st.prices !== false, onchange: e => set('prices', e.target.checked) }),
@@ -594,9 +647,12 @@ function coinjoinIntro() {
       '• Each person pays their own share of the fee.', h('br'),
       '• Signed so it is valid only on BTC, never on the spamchain.'),
     h('p', { class: 'small faint' }, 'If you turn it on, this tab opens up and this server starts talking to the relay (relay.kilombino.com) to list the pools. You can turn it off again here.'),
+    h('p', { class: 'small faint' }, 'With notifications, new public pools are told about (StartOS notifications, and Telegram or this browser if you set them up); your own rounds always are. Without, the tab opens all the same and you can turn them on later in 🔔 Notifications.'),
     h('div', { class: 'btns' },
       h('button', { class: 'soft', onclick: () => { S.tab = 'btc'; render(); } }, 'NOT NOW'),
-      h('button', { class: 'primary', onclick: () => api('coinjoin/enable', { on: true }).then(r => { C.st = r; render(); reloadPools(); }).catch(e => toast(e.message)) }, 'YES, TURN IT ON')));
+      h('button', { class: 'primary', onclick: () => api('coinjoin/enable', { on: true, notify: true }).then(r => { C.st = r; render(); reloadPools(); }).catch(e => toast(e.message)) }, 'YES, NOTIFY ME')),
+    h('div', { class: 'btns' },
+      h('button', { class: 'soft', onclick: () => api('coinjoin/enable', { on: true, notify: false }).then(r => { C.st = r; render(); reloadPools(); }).catch(e => toast(e.message)) }, 'OPEN WITHOUT NOTIFICATIONS')));
 }
 
 function phaseText(p) {
@@ -661,7 +717,9 @@ function myPool(p, embedded) {
   if (['ABORTED', 'REJECTED'].includes(p.phase)) acts.push(h('button', { class: 'link faint', onclick: () => cjAct('coinjoin/remove', { pool: p.id }) }, 'remove'));
   const coinLine = h('p', { class: 'faint small' }, `${p.coins > 1 ? 'your ' + p.coins + ' coins' : 'your coin'} ${sats(p.coinValue)} → ${amountOf(p.amount, p.outputs)} mixed${p.change > 0 ? ' + ' + sats(p.change) + ' change' : ''} · fee ${sats(p.coinValue - p.amount * (p.outputs || 1) - p.change)}`);
   // Only on this server: where the mixed outputs go when it is not this wallet.
-  const destLine = p.dest ? h('p', { class: 'small', style: 'color:var(--purple)' }, 'mixed outputs go to: ' + p.dest) : null;
+  const destLine = p.dest ? h('div', {}, h('p', { class: 'small accent' }, 'mixed outputs go to: ' + p.dest),
+    ['JOINING', 'ABORTED', 'REJECTED'].includes(p.phase) ? null : h('button', { class: 'link', onclick: () => showAddresses('This round\'s addresses',
+      api('coinjoin/round/addresses', { pool: p.id }), 'The addresses of that wallet this round\'s mixed outputs go to, with their paths.') }, 'show the addresses')) : null;
   if (embedded) return h('div', { class: 'mt' }, coinLine, destLine, acts);
   return h('div', { class: 'panel' + (['VOTING', 'SIGNING'].includes(p.phase) ? ' warn' : ['ABORTED', 'REJECTED'].includes(p.phase) ? ' bad' : '') },
     h('div', { class: 'between' }, h('span', { class: 'mid' }, amountOf(p.amount, p.outputs) + ' sats' + (p.script === 'p2tr' ? ' · Taproot' : '')), h('span', { class: 'faint small' }, (p.private ? '🔒 ' : '') + (p.creator ? 'your pool' : 'joined'))),
@@ -773,8 +831,10 @@ function coinPicker() {
   if (!dests.some(d => d.id === C.dest)) C.dest = '';
   const destPick = dests.length ? h('div', {}, h('div', { class: 'soft small mt' }, 'Mixed outputs go to'),
     [{ id: '', label: 'This wallet (default)' }].concat(dests).map(d => h('label', { class: 'check small' },
-      h('input', { type: 'radio', name: 'cjdest', checked: C.dest === d.id, onchange: () => { C.dest = d.id; render(); } }), h('span', {}, d.label))),
-    C.dest ? h('p', { class: 'faint small' }, "Unused receive addresses of that wallet; the change, if any, comes back here. Nobody in the round can tell: an output is just an address of the pool's type.") : null) : null;
+      h('input', { type: 'radio', name: 'cjdest', checked: C.dest === d.id, onchange: () => { C.dest = d.id; render(); } }), h('span', {}, d.which || d.label))),
+    C.dest ? h('p', { class: 'faint small' }, "Unused receive addresses of that wallet; the change, if any, comes back here. Nobody in the round can tell: an output is just an address of the pool's type.") : null,
+    C.dest ? h('button', { class: 'link', onclick: () => showAddresses('Where the mixed outputs go', api('coinjoin/dest/preview', { dest: C.dest, script: cjType(), outputs: o }),
+      'The unused receive addresses of that wallet the mixed outputs would go to now, one per output. Compare them with that wallet (Sparrow, Shrike: Addresses › Receive) before joining.') }, 'SHOW THE ADDRESSES') : null) : null;
   const submit = async () => {
     use.disabled = true;
     try {
@@ -839,6 +899,19 @@ function coinPicker() {
     h('div', { class: 'btns' }, h('button', { class: 'soft', onclick: cancelPick }, 'CANCEL'), use));
 }
 
+/** A list of addresses with their paths (another wallet's, for a coinjoin), full and copyable. */
+async function showAddresses(title, req, note) {
+  let list;
+  try { list = await req; } catch (e) { return toast(e.message); }
+  let m;
+  m = modal(h('div', { class: 'label' }, title), h('p', { class: 'small soft' }, note),
+    list.map((a, i) => h('div', { class: 'tx', onclick: () => copy(a.address) },
+      h('div', { class: 'between' }, h('span', { class: 'soft small' }, list.length > 1 ? `output ${i + 1}` : 'output'), h('span', { class: 'faint small' }, a.path)),
+      h('div', { class: 'mono small' }, a.address))),
+    h('p', { class: 'faint small' }, 'Tap one to copy it.'),
+    h('div', { class: 'btns' }, h('button', { class: 'soft', onclick: () => m.remove() }, 'CLOSE')));
+}
+
 /**
  * The perfect coin for a pool: a payment to a fresh address of this wallet of exactly the
  * amount plus the no-change fee, through the normal send review. Paid with unmixed coins only.
@@ -870,19 +943,25 @@ function soundOn() { try { return localStorage.getItem('kw.cjSound') === '1'; } 
 /** Other wallets a coinjoin's mixed outputs can go to: a watch-only wallet's key or Jam's export. */
 function destinationsPanel() {
   const ds = C.st.destinations || [];
-  const text = h('textarea', { placeholder: 'zpub / xpub of a watch-only wallet, or Jam\'s export line (kilowallet-jm:v1:…)', rows: 2 });
+  const ks = { text: '', type: '', id: 'dest' };
+  const kType = xpubTypeChoice(ks, [['p2wpkh', 'Native SegWit · bc1q… (BIP84)'], ['p2tr', 'Taproot · bc1p… (BIP86)']]);
+  const text = h('textarea', { placeholder: 'zpub / xpub of a watch-only wallet, or Jam\'s export line (kilowallet-jm:v1:…)', rows: 2,
+    oninput: e => { ks.text = e.target.value; kType.redraw(); } });
   const label = h('input', { placeholder: 'name (optional)', autocomplete: 'off' });
-  const taproot = h('input', { type: 'checkbox' });
   const since = h('input', { type: 'date' });
   const pw = h('input', { type: 'password', placeholder: 'password, to confirm', autocomplete: 'current-password' });
-  const add = () => api('destinations/add', { text: text.value.trim(), label: label.value, taproot: taproot.checked,
+  const add = () => {
+    const k = xpubInfo(text.value);
+    if (k && (k.prefix === 'xpub' || k.prefix === 'tpub') && !ks.type) return toast('Pick the address type of this xpub first.');
+    return api('destinations/add', { text: text.value.trim(), label: label.value, type: ks.type,
       since: since.value ? Math.floor(new Date(since.value + 'T00:00:00Z').getTime() / 1000) : null, password: pw.value })
     .then(r => { C.st.destinations = r; toast('Added. The node is looking through the chain for it: it can take a while.'); render(); }).catch(e => toast(e.message));
+  };
   return h('details', { class: 'panel' }, h('summary', { class: 'label' }, '📤 Other wallets for mixed outputs'),
     h('p', { class: 'small soft' }, 'A round\'s mixed outputs can go straight to another wallet of yours instead of this one: a watch-only wallet (its zpub, or a Taproot xpub) or your Jam wallet\'s first jar, Apricot (its "View in Kilowallet" line). The node keeps a watch-only copy of it, so only addresses that never received anything are used. Only output addresses ever leave this server.'),
-    ds.length ? ds.map(d => h('div', { class: 'between small' }, h('span', {}, d.label + ' · ' + (d.type === 'p2tr' ? 'bc1p' : 'bc1q') + (d.scanning ? ' · looking through the chain…' : '')),
+    ds.length ? ds.map(d => h('div', { class: 'between small' }, h('span', {}, (d.which || d.label) + ' · ' + (d.type === 'p2tr' ? 'bc1p' : 'bc1q') + (d.scanning ? ' · looking through the chain…' : '')),
       h('button', { class: 'link faint', onclick: () => api('destinations/remove', { id: d.id }).then(r => { C.st.destinations = r; render(); }).catch(e => toast(e.message)) }, 'remove'))) : null,
-    text, label, h('label', { class: 'check small' }, taproot, 'Taproot (bc1p) watch-only wallet'),
+    text, kType, label,
     h('div', { class: 'soft small mt' }, 'made around (the node looks back from that day, so every address it ever used is known)'), since,
     pw, h('div', { class: 'btns' }, h('button', { class: 'soft', onclick: add }, 'ADD')));
 }

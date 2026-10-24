@@ -40,11 +40,17 @@ object Spend {
         val cpfpParent: String? = null, // CPFP: the stuck transaction this child pulls along
         val packageRate: Double = 0.0,
         var psbt: ByteArray? = null,    // watch-only: the PSBT handed out, the only one taken back
+        /** A cancellation (RBF): [replaces] goes back to this wallet instead of to its recipients. */
+        val cancels: Boolean = false,
+        /** A cancellation: the outputs of the payment it cancels (addresses), which will never exist. */
+        val cancelled: List<String> = emptyList(),
     ) {
         val id: String = java.util.UUID.randomUUID().toString()
         val vbytes: Double get() = vsize(inputs, outputs.map { it.scriptPubKey })
         /** The wallet's own type (a watch-only wallet's PSBT); each input signs with its own [NodeWallet.Utxo.type]. */
         var type: ScriptType = ScriptType.P2WPKH
+        /** The account [changeIndex] belongs to (a hot wallet has a bc1q and a bc1p one). */
+        var changeType: ScriptType = ScriptType.P2WPKH
     }
 
     private fun inputVbytes(t: ScriptType) = when (t) {
@@ -63,13 +69,22 @@ object Spend {
      * Send [amount] (everything, less the fee, when null) to [to] at [rate] sat/vB from [chosen]
      * coins, or from the largest coins first when none are chosen.
      */
-    fun plan(w: NodeWallet, utxos: List<NodeWallet.Utxo>, chosen: Set<String>, to: String, amount: Long?, rate: Double): Draft {
+    /**
+     * [changeTo]: the account the change goes to (the wallet's own, or the pool's for the payment
+     * that makes a perfect coin, as the app since 1.2.5).
+     */
+    fun plan(w: NodeWallet, utxos: List<NodeWallet.Utxo>, chosen: Set<String>, to: String, amount: Long?, rate: Double,
+             changeTo: NodeWallet = w): Draft =
+        planRaw(w, utxos, chosen, to, amount, rate, changeTo).also { it.changeType = changeTo.type }
+
+    private fun planRaw(w: NodeWallet, utxos: List<NodeWallet.Utxo>, chosen: Set<String>, to: String, amount: Long?, rate: Double,
+                        changeTo: NodeWallet): Draft {
         require(rate in 0.1..1000.0) { "The fee rate must be between 0.1 and 1000 sat/vB." }
         val toScript = runCatching { Address.decodeToScriptPubKey(to.trim()) }.getOrElse { error("That is not a valid address.") }
         require(toScript.isNotEmpty() && toScript[0] != 0x6a.toByte()) { "That address can't receive." }
         val pool = if (chosen.isEmpty()) utxos else utxos.filter { it.outpoint in chosen }
         require(pool.isNotEmpty()) { if (chosen.isEmpty()) "No coins to spend yet." else "Pick at least one coin." }
-        val (changeIndex, changeScript) = w.peekChange()
+        val (changeIndex, changeScript) = changeTo.peekChange()
         if (amount == null) {
             val f = fee(pool, listOf(toScript), rate)
             val send = pool.sumOf { it.value } - f
@@ -115,7 +130,34 @@ object Spend {
         val sent = newOuts.filterIndexed { n, _ -> n != changeAt }
         return Draft(inputs, newOuts, sent.firstOrNull()?.let { addressOf(it.scriptPubKey) } ?: "(replacement)",
             sent.sumOf { it.value }, newFee, change, ours[hex(outs[changeAt])]?.second,
-            replaces = txid, replacedFee = oldFee).also { it.type = w.type }
+            replaces = txid, replacedFee = oldFee).also { it.type = w.type; it.changeType = types[hex(outs[changeAt])] ?: w.type }
+    }
+
+    /**
+     * Cancel unconfirmed send [txid] (RBF, as the app since 1.2.5): the same coins, all of them, to
+     * one fresh change address of this wallet ([backTo]: the account of the first coin), so the
+     * recipients get nothing. Like a speed-up it pays the old fee plus 1 sat/vB of its own size
+     * (and at least [rate]). If the original confirms first, the node refuses the replacement.
+     */
+    fun cancel(w: NodeWallet, txid: String, rate: Double, ours: Map<String, Pair<Int, Int>>, types: Map<String, ScriptType>,
+               backTo: (ScriptType) -> NodeWallet): Draft {
+        val tx = TxParse.parse(w.rawTx(txid))
+        val inputs = tx.inputs.map { i ->
+            val prev = TxParse.parse(w.rawTx(i.txid)).outputs[i.vout]
+            val h = com.kilombino.pyblockwatch.crypto.Hashes.run { prev.scriptPubKey.toHex() }
+            val (b, idx) = ours[h]
+                ?: error("This transaction spends coins that are not in this wallet: it can't be cancelled from here.")
+            NodeWallet.Utxo(i.txid, i.vout, prev.value, 0, b, idx, types[h] ?: w.type)
+        }
+        val back = backTo(inputs.first().type)
+        val (ci, to) = back.peekChange()
+        val oldFee = inputs.sumOf { it.value } - tx.outputs.sumOf { it.value }
+        val newFee = maxOf(fee(inputs, listOf(to), rate.coerceIn(0.1, 1000.0)), oldFee + fee(inputs, listOf(to), 1.0) + 1)
+        val value = inputs.sumOf { it.value } - newFee
+        require(value > DUST) { "The coins (${inputs.sumOf { it.value }} sats) can't cover a $newFee-sat fee." }
+        return Draft(inputs, listOf(TxBuilder.Output(to, value)), addressOf(to), value, newFee, 0, ci,
+            replaces = txid, replacedFee = oldFee, cancels = true, cancelled = tx.outputs.map { addressOf(it.scriptPubKey) })
+            .also { it.type = w.type; it.changeType = back.type }
     }
 
     /** CPFP: spend our outputs of a stuck transaction back to ourselves so both pay [rate] together. */
@@ -135,7 +177,7 @@ object Spend {
         val sum = ours.sumOf { it.value }
         require(sum - need > DUST) { "Your part of it ($sum sats) can't cover a $need-sat fee." }
         return Draft(ours, listOf(TxBuilder.Output(to, sum - need)), addressOf(to), sum - need, need, sum - need, changeIndex,
-            cpfpParent = txid, packageRate = (parentFee + need) / (parentVsize + childVsize)).also { it.type = w.type }
+            cpfpParent = txid, packageRate = (parentFee + need) / (parentVsize + childVsize)).also { it.type = w.type; it.changeType = w.type }
     }
 
     /** A fee that looks like a slip (the app's rule): above 100 sat/vB, 100 000 sats, or 5% of the amount. */

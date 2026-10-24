@@ -23,8 +23,24 @@ class NodeWallet(private val dir: File, private val rpc: Rpc, accountKey: String
     /** The key as the node's descriptors want it: "xpub" version bytes on mainnet. */
     // The node's descriptors want an xpub on mainnet and a tpub on regtest/testnet (tests only).
     private val descKey = toVersion(accountKey, if (testnet) 0x043587CF else 0x0488B21E)
-    /** One node wallet per account key, so switching wallets never mixes their history. */
-    val name = "kilowallet-" + Hashes.sha256(descKey.toByteArray()).toHex().take(10)
+    /** The name before 0.8.0: one node wallet per account key only. */
+    private val legacyName = "kilowallet-" + Hashes.sha256(descKey.toByteArray()).toHex().take(10)
+    private val namesFile = File(dir, "node-wallets.json")
+    /**
+     * One node wallet per account key AND address type (as the app since 1.2.4): the descriptors
+     * are imported only when the node wallet is made, so the same key read as bc1q and then as
+     * Taproot would keep the bc1q descriptors and every bc1p address would look unused. Native
+     * SegWit keeps its old name; another type keeps the old name too when the node wallet of
+     * that name already holds this type's descriptors (made by an earlier version), see [ensure].
+     */
+    @Volatile var name: String = if (type == ScriptType.P2WPKH) legacyName else (chosenName() ?: typedName())
+        private set
+    private fun typedName() = "kilowallet-" + Hashes.sha256((descKey + ":" + type.name).toByteArray()).toHex().take(10)
+    private fun chosenName(): String? = runCatching { JSONObject(namesFile.readText()).optString(typedName()).ifEmpty { null } }.getOrNull()
+    @Synchronized private fun choose(n: String) {
+        val o = runCatching { JSONObject(namesFile.readText()) }.getOrDefault(JSONObject())
+        o.put(typedName(), n); namesFile.writeText(o.toString()); name = n
+    }
     private val stateFile = File(dir, "addresses.json")
 
     data class Tx(val txid: String, val net: Long, val confirmations: Int, val time: Long, val fee: Long?)
@@ -44,9 +60,17 @@ class NodeWallet(private val dir: File, private val rpc: Rpc, accountKey: String
         if (to > w.optInt("top$branch", 0)) { w.put("top$branch", to); saveState(o) }
     }
 
-    fun pubkey(branch: Int, index: Int): ByteArray = Bip32.derivePath(account, branch, index).pubkey()
-    fun address(branch: Int, index: Int): String = Address.encode(pubkey(branch, index), type)
-    fun script(branch: Int, index: Int): ByteArray = Address.scriptPubKey(pubkey(branch, index), type)
+    /** The receive and change branch keys, derived once; each address is then one step from them, and kept. */
+    private val branches = arrayOf(Bip32.deriveChild(account, 0), Bip32.deriveChild(account, 1))
+    private val pubkeys = java.util.concurrent.ConcurrentHashMap<Long, ByteArray>()
+    fun pubkey(branch: Int, index: Int): ByteArray =
+        pubkeys.getOrPut((branch.toLong() shl 32) or index.toLong()) { Bip32.deriveChild(branches[branch], index).pubkey() }
+    fun address(branch: Int, index: Int): String =
+        if (type == ScriptType.P2TR) Spend.addressOf(script(branch, index)) else Address.encode(pubkey(branch, index), type)
+    private val scriptsMemo = java.util.concurrent.ConcurrentHashMap<Long, ByteArray>()
+    /** Kept too: a Taproot script costs another point multiplication (the tweak). */
+    fun script(branch: Int, index: Int): ByteArray =
+        scriptsMemo.getOrPut((branch.toLong() shl 32) or index.toLong()) { Address.scriptPubKey(pubkey(branch, index), type) }
 
     /** The next unused receive address (the same one until something arrives on it, or [next]). */
     fun receive(): Pair<Int, String> { val i = top(0); return i to address(0, i) }
@@ -100,7 +124,28 @@ class NodeWallet(private val dir: File, private val rpc: Rpc, accountKey: String
         return (rpc.call("getblockheader", hash) as JSONObject).getLong("time") - 7200
     }
 
+    /**
+     * Not native SegWit, first time here: an earlier version may have made this wallet under the
+     * key-only name. Kept if that node wallet watches this very type; otherwise the typed name.
+     */
+    val nameResolved: Boolean get() = type == ScriptType.P2WPKH || chosenName() != null
+
+    fun resolveName() {
+        if (nameResolved) return
+        val loaded = (rpc.call("listwallets") as JSONArray).toList().map { it.toString() }
+        val wasLoaded = legacyName in loaded
+        val there = wasLoaded || runCatching { rpc.call("loadwallet", legacyName) }.isSuccess
+        val mine = there && runCatching {
+            val d = (rpc.call("listdescriptors", wallet = legacyName) as JSONObject).getJSONArray("descriptors")
+            val want = desc(0).substringBefore('(') + "("
+            (0 until d.length()).any { d.getJSONObject(it).getString("desc").startsWith(want) }
+        }.getOrDefault(false)
+        if (there && !mine && !wasLoaded) runCatching { rpc.call("unloadwallet", legacyName) }
+        choose(if (mine) legacyName else typedName())
+    }
+
     fun ensure(rescanFrom: Long? = null) {
+        resolveName()
         val loaded = (rpc.call("listwallets") as JSONArray).toList().map { it.toString() }
         if (name in loaded) return
         val exists = runCatching { rpc.call("loadwallet", name) }.isSuccess

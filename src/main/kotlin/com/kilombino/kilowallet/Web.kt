@@ -59,6 +59,7 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
             require(dest.type == type) { "${dest.label} has no addresses of this pool's type." }
             d.scripts(dest, n, coinjoin.heldScripts())
         }
+        coinjoin.destWhich = { id -> d.list().firstOrNull { it.id == id }?.which() }
     }
     /** Open pools as last listed, so a join is checked against what the user saw. */
     @Volatile private var pools: List<Protocol.Terms> = emptyList()
@@ -141,7 +142,13 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
         }.start()
         wallet = w
         openTaproot()
+        warm(w)
     }
+
+    /** Derives the addresses a speed-up or a cancellation looks its coins up in, ahead of time (seconds of work). */
+    private fun warm(w: NodeWallet) = Thread {
+        runCatching { for (b in 0..1) for (i in 0 until OURS) w.script(b, i) }
+    }.apply { isDaemon = true; priority = Thread.MIN_PRIORITY }.start()
 
     /** The hot wallet's Taproot account, once its key is known (derived from the words at an unlock). */
     private fun openTaproot(rescanFrom: Long? = null) {
@@ -151,6 +158,7 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
         Thread { runCatching { requireChain(); w.ensure(rescanFrom ?: runCatching { w.autoSince() }.getOrNull()) }
             .onFailure { System.err.println("Taproot account: ${it.message}") } }.start()
         walletTr = w
+        warm(w)
     }
 
     /** First unlock with the words after 0.3.0 (or a new wallet): work out and open the Taproot account. */
@@ -248,6 +256,9 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
             }
             "/api/bump" -> review(ex, w, Spend.bump(w, b.getString("txid"), b.getDouble("rate"), ours(), oursTypes()).also { requireUnlocked(it) })
             "/api/cpfp" -> review(ex, w, Spend.cpfp(w, b.getString("txid"), b.getDouble("rate"), allSpendable()))
+            // Cancel an unconfirmed send (RBF back to a fresh change address of this wallet).
+            "/api/cancel" -> review(ex, w, Spend.cancel(w, b.getString("txid"), b.optDouble("rate", 1.0), ours(), oursTypes()) { t -> walletFor(t) ?: w }
+                .also { requireUnlocked(it) })
             "/api/send/confirm" -> {
                 val d = drafts[b.getString("draft")] ?: error("This review is no longer open: prepare it again.")
                 require(mode() == "hot") { "A watch-only wallet signs elsewhere: export the PSBT." }
@@ -259,7 +270,7 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
                 val txid = w.broadcast(signed.rawHex).also { w.noteSent(it) }
                 // The perfect coin of a pool: its key goes with it, so the pool goes on by itself.
                 runCatching { coinjoin.exactSigned(d.toAddress, d.amount, sec) }
-                d.changeIndex?.let { w.freshChange() }
+                afterSent(w, d)
                 drafts.remove(d.id); mixWarnings.remove(d.id)
                 reply(ex, 200, JSONObject().put("txid", txid))
             }
@@ -278,7 +289,7 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
                 requireUnlocked(d)
                 val signed = Spend.finishPsbt(w, d, returned, cfg().optString("keyOrigin"))
                 val txid = w.broadcast(signed.rawHex).also { w.noteSent(it) }
-                d.changeIndex?.let { w.freshChange() }
+                afterSent(w, d)
                 drafts.remove(d.id); mixWarnings.remove(d.id)
                 reply(ex, 200, JSONObject().put("txid", txid))
             }
@@ -302,7 +313,7 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
             "/api/destinations/add" -> {
                 recheck(b)
                 val since = if (b.isNull("since") || !b.has("since")) null else b.getLong("since")
-                destinations.add(b.getString("text"), b.optString("label"), b.optBoolean("taproot"), since)
+                destinations.add(b.getString("text"), b.optString("label"), chosenType(b), since)
                 reply(ex, 200, destinationsJson())
             }
             "/api/destinations/remove" -> {
@@ -522,12 +533,15 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
         val locked = coinjoin.lockedOutpoints()
         require(chosen.none { it in locked }) { "A chosen coin is in a coinjoin round right now." }
         val coins = allSpendable()
+        // The payment that makes a perfect coin: its change goes to the pool's account, like the coin.
+        val changeTo = runCatching { coinjoin.exactType(Spend.addressOf(com.kilombino.pyblockwatch.crypto.Address.decodeToScriptPubKey(to))) }
+            .getOrNull()?.let { walletFor(it) } ?: w
         if (chosen.isEmpty() && amount != null) {
             val mixed = coinjoin.mixedScripts()
             val plain = coins.filter { !isMixed(w, it, mixed) }
-            if (plain.size in 1 until coins.size) runCatching { return Spend.plan(w, plain, chosen, to, amount, rate) }
+            if (plain.size in 1 until coins.size) runCatching { return Spend.plan(w, plain, chosen, to, amount, rate, changeTo) }
         }
-        return Spend.plan(w, coins, chosen, to, amount, rate)
+        return Spend.plan(w, coins, chosen, to, amount, rate, changeTo)
     }
 
     /** A warning when the send would undo a mix: a mixed coin spent with others ties them together again. */
@@ -573,7 +587,12 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
         val post = ex.requestMethod == "POST"
         when (p) {
             "/api/coinjoin" -> reply(ex, 200, coinjoinJson(w))
-            "/api/coinjoin/enable" -> { coinjoin.setSetting("enabled", b.optBoolean("on", true)); reply(ex, 200, coinjoinJson(w)) }
+            "/api/coinjoin/enable" -> {
+                coinjoin.setSetting("enabled", b.optBoolean("on", true))
+                // "Open without notifications" (as the app since 1.2.5): the tab, but no word about new pools.
+                if (b.has("notify")) coinjoin.setSetting("notify_new_pools", b.getBoolean("notify"))
+                reply(ex, 200, coinjoinJson(w))
+            }
             "/api/coinjoin/events" -> reply(ex, 200, JSONArray(coinjoin.events.map { eventJson(it) }))
             "/api/coinjoin/settings" -> {
                 if (post) {
@@ -625,7 +644,7 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
                 val dest = b.optString("dest").ifEmpty { null }
                 val mixes = dest?.let { coinjoin.destScripts!!(it, pw.type, outputs) }
                 val st = coinjoin.create(s, pw, us, amount, rate, minPeers, maxPeers, hours, b.optString("poolPassword"), maxInputs, outputs, mixes)
-                dest?.let { coinjoin.rememberDest(st.poolId, it) }
+                dest?.let { coinjoin.rememberDest(st.poolId, it, destinations.get(it).which()) }
                 reply(ex, 200, JSONObject().put("pool", st.poolId))
             }
             "/api/coinjoin/join" -> {
@@ -641,8 +660,24 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
                 val dest = b.optString("dest").ifEmpty { null }
                 val mixes = dest?.let { coinjoin.destScripts!!(it, pw.type, t.outputs) }
                 coinjoin.join(s, pw, us, t, b.optString("poolPassword"), mixes)
-                dest?.let { coinjoin.rememberDest(t.id, it) }
+                dest?.let { coinjoin.rememberDest(t.id, it, destinations.get(it).which()) }
                 reply(ex, 200, ok())
+            }
+            // The unused addresses of a destination the mixed outputs would take now, one per output, with their paths.
+            "/api/coinjoin/dest/preview" -> {
+                val d = destinations.get(b.getString("dest"))
+                val t = if (b.optString("script") == "p2tr") ScriptType.P2TR else ScriptType.P2WPKH
+                require(d.type == t) { "${d.label} has no addresses of this pool's type." }
+                val n = b.optInt("outputs", 1)
+                require(n in 1..Protocol.MAX_OUTPUTS) { "Mixed outputs per person: 1 to ${Protocol.MAX_OUTPUTS}." }
+                reply(ex, 200, JSONArray(destinations.preview(d, n, coinjoin.heldScripts()).map { it.json() }))
+            }
+            // A round going to another wallet: the real addresses of its mixed outputs, with their paths.
+            "/api/coinjoin/round/addresses" -> {
+                val st = coinjoin.session(b.getString("pool")).state
+                val id = coinjoin.destOf(st.poolId) ?: error("This round's mixed outputs come to this wallet.")
+                val d = destinations.list().firstOrNull { it.id == id } ?: error("That wallet is not a destination here any more.")
+                reply(ex, 200, JSONArray(destinations.describe(d, st.mixScripts).map { it.json() }))
             }
             "/api/coinjoin/close" -> { coinjoin.session(b.getString("pool")).requestClose(); reply(ex, 200, ok()) }
             "/api/coinjoin/vote" -> { coinjoin.session(b.getString("pool")).vote(b.getBoolean("accept")); reply(ex, 200, ok()) }
@@ -727,7 +762,8 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
             .put("expiresAt", st.terms.expiresAt).put("phaseDeadline", st.phaseDeadline).put("voteDeadline", st.voteDeadline)
             .put("coinValue", st.seat.inputValue).put("coins", st.seat.coins.size).put("change", st.seat.changeValue)
             .put("script", Protocol.scriptName(st.terms.script))
-            .put("dest", coinjoin.destOf(st.poolId)?.let { id -> destinations.list().firstOrNull { it.id == id }?.label } ?: JSONObject.NULL)
+            .put("dest", coinjoin.destOf(st.poolId)?.let { id ->
+                coinjoin.destWhichOf(st.poolId) ?: destinations.list().firstOrNull { it.id == id }?.which() ?: "another wallet (removed since)" } ?: JSONObject.NULL)
             .put("iAsked", st.voteBy != null && st.voteBy == st.token?.let { Protocol.tokenHash(it) })
             .put("voted", st.votedOn != null && st.votedOn == st.voteId)
             .put("signed", st.postedSig).put("sigs", st.sigs.size).put("txid", st.txid ?: "")
@@ -744,15 +780,21 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
 
     private fun ours(): Map<String, Pair<Int, Int>> {
         val m = HashMap<String, Pair<Int, Int>>()
-        for (w in wallets()) for (b in 0..1) for (i in 0 until 400) m[w.script(b, i).toHex()] = b to i
+        for (w in wallets()) for (b in 0..1) for (i in 0 until OURS) m[w.script(b, i).toHex()] = b to i
         return m
     }
 
     /** The type of each of our scripts, for a replacement that spends coins of both accounts. */
     private fun oursTypes(): Map<String, ScriptType> {
         val m = HashMap<String, ScriptType>()
-        for (w in wallets()) for (b in 0..1) for (i in 0 until 400) m[w.script(b, i).toHex()] = w.type
+        for (w in wallets()) for (b in 0..1) for (i in 0 until OURS) m[w.script(b, i).toHex()] = w.type
         return m
+    }
+
+    /** After a send went out: its change address is used, and a cancelled payment's perfect coins will never come. */
+    private fun afterSent(w: NodeWallet, d: Spend.Draft) {
+        d.changeIndex?.let { (walletFor(d.changeType) ?: w).freshChange() }
+        if (d.cancels) runCatching { coinjoin.dropExact(d.cancelled) }
     }
 
     private fun review(ex: HttpExchange, w: NodeWallet, d: Spend.Draft) {
@@ -760,7 +802,8 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
         val mix = mixWarning(w, d)?.also { mixWarnings[d.id] = it }
         reply(ex, 200, JSONObject().put("draft", d.id).put("to", d.toAddress).put("amount", d.amount).put("fee", d.fee)
             .put("change", d.change).put("inputs", d.inputs.size).put("vbytes", d.vbytes)
-            .put("changeAddress", d.changeIndex?.let { Spend.addressOf(w.script(1, it)) } ?: JSONObject.NULL)
+            .put("changeAddress", d.changeIndex?.let { Spend.addressOf((walletFor(d.changeType) ?: w).script(1, it)) } ?: JSONObject.NULL)
+            .put("cancels", d.cancels)
             .put("rate", d.fee / d.vbytes).put("concern", Spend.concern(d) ?: JSONObject.NULL)
             .put("replaces", d.replaces ?: JSONObject.NULL).put("replacedFee", d.replacedFee)
             .put("cpfpParent", d.cpfpParent ?: JSONObject.NULL).put("packageRate", d.packageRate)
@@ -802,11 +845,19 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
         reply(ex, 200, JSONObject().put("ok", true).apply { if (!restored) put("words", words.joinToString(" ")) })
     }
 
+    /** The address type picked for a plain xpub ("p2wpkh", "p2tr", "p2sh-p2wpkh", "p2pkh"; or the older `taproot` flag). */
+    private fun chosenType(b: JSONObject): ScriptType? = when (b.optString("type")) {
+        "p2wpkh" -> ScriptType.P2WPKH; "p2tr" -> ScriptType.P2TR; "p2sh-p2wpkh" -> ScriptType.P2SH_P2WPKH; "p2pkh" -> ScriptType.P2PKH
+        else -> if (b.optBoolean("taproot")) ScriptType.P2TR else null
+    }
+
     private fun setupWatch(ex: HttpExchange, b: JSONObject) {
         requireNoWallet()
-        val key = b.getString("key").trim()
+        val key = b.getString("key").trim().replace(Regex("\\s"), "")
         val parsed = runCatching { Bip32.parseExtendedPubKey(key) }.getOrElse { error(it.message ?: "Not an extended public key.") }
-        val t = if (b.optBoolean("taproot")) ScriptType.P2TR else parsed.scriptType
+        // A ypub/zpub says its addresses; a plain xpub doesn't, so its type is asked (as the app since 1.2.4).
+        val t = if (parsed.scriptType != ScriptType.P2PKH) parsed.scriptType
+            else chosenType(b) ?: error("A plain xpub doesn't say which addresses it makes: pick the type your wallet uses.")
         vault.store(listOf("watch-only"), "", b.getString("password"))
         saveCfg { it.put("mode", "watch").put("type", t.name).put("accountKey", key) }
         openWallet(b.optLong("since", 0).takeIf { it > 0 }, restored = true)
@@ -878,5 +929,9 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
         d.public().put("scanning", destinations.scanning(d))
     })
 
-    companion object { const val VERSION = "0.7.0" }
+    companion object {
+        const val VERSION = "0.8.0"
+        /** How far (per branch) a replaced transaction's coins are looked up in this wallet. */
+        const val OURS = 400
+    }
 }

@@ -243,6 +243,8 @@ class Coinjoin(private val dir: File, private val rpc: Rpc, private val walletPr
 
     /** Unused scripts of a destination (id, pool type, how many): set by the server. */
     @Volatile var destScripts: ((String, ScriptType, Int) -> List<ByteArray>)? = null
+    /** A destination's name and key start, for a round's card: set by the server. */
+    @Volatile var destWhich: ((String) -> String?)? = null
 
     /** Mixed-output scripts seats still count on: rounds not over, or over after we posted ours. */
     fun heldScripts(): Set<String> = sessions.values.map { it.state }.filter { st ->
@@ -252,13 +254,31 @@ class Coinjoin(private val dir: File, private val rpc: Rpc, private val walletPr
 
     private val destFile = File(dir, "coinjoin-dest.json")
     /** Which destination a pool's mixed outputs go to (only when not this wallet), for its card. */
-    @Synchronized fun rememberDest(poolId: String, destId: String) {
+    /** [which]: that wallet's name and key start when the round began, for the card (see [Destinations.Dest.which]). */
+    @Synchronized fun rememberDest(poolId: String, destId: String, which: String? = null) {
         val o = if (destFile.exists()) runCatching { JSONObject(destFile.readText()) }.getOrDefault(JSONObject()) else JSONObject()
-        o.put(poolId, destId); destFile.writeText(o.toString())
+        o.put(poolId, destId + (which?.let { "|$it" } ?: "")); destFile.writeText(o.toString())
     }
-    @Synchronized fun destOf(poolId: String): String? =
+    @Synchronized private fun destNote(poolId: String): String? =
         if (destFile.exists()) runCatching { JSONObject(destFile.readText()).optString(poolId).ifEmpty { null } }.getOrNull() else null
+    fun destOf(poolId: String): String? = destNote(poolId)?.substringBefore('|')
+    /** The wallet noted when the round began (rounds before 0.8.0 have none). */
+    fun destWhichOf(poolId: String): String? = destNote(poolId)?.substringAfter('|', "")?.ifEmpty { null }
     fun waitingExact(): List<AfterExact> = afterExact.values.filter { it.node != null }
+
+    /** The address type of the perfect coin awaited at [address], if it is one: its payment's change goes to that type too. */
+    fun exactType(address: String): ScriptType? = afterExact[address]?.type
+
+    /**
+     * A payment that made perfect coins was cancelled (RBF back to this wallet): those coins will
+     * never exist, and their pools are not waited for. [addresses]: the cancelled payment's outputs.
+     */
+    fun dropExact(addresses: Collection<String>) {
+        for (a in addresses) afterExact.remove(a)?.let { x ->
+            emit("Coinjoin: perfect coin cancelled", "The payment of ${sats(x.value)} sats to yourself was cancelled: " +
+                (if (x.create != null) "the pool is not opened." else "the pool is not joined."), x.poolId)
+        }
+    }
 
     /** The payment of [amount] to [address] was signed with [secret]: keep that coin's key for its pool. */
     fun exactSigned(address: String, amount: Long, secret: Vault.Secret) {
@@ -291,7 +311,7 @@ class Coinjoin(private val dir: File, private val rpc: Rpc, private val walletPr
                     val t = fetchPools().firstOrNull { it.id == a.poolId } ?: error("that pool is no longer open")
                     joinWith(p, w, t, a.poolPassword)
                 }
-                a.dest?.let { rememberDest(st.poolId, it) }
+                a.dest?.let { rememberDest(st.poolId, it, destWhich?.invoke(it)) }
                 st
             }.onSuccess { emit("Coinjoin: perfect coin in", "${sats(a.value)} sats confirmed: " + (if (a.create != null) "pool opened" else "asked to join") + " on its own", it.poolId) }
              .onFailure { emit("Coinjoin: perfect coin ready", "${sats(a.value)} sats confirmed, but ${it.message}. Join a pool with it.", null) }
@@ -332,11 +352,25 @@ class Coinjoin(private val dir: File, private val rpc: Rpc, private val walletPr
                 val last = settings().optLong("last_pool_seen", System.currentTimeMillis() / 1000 - 3600)
                 val pools = fetchPools(86400).filter { it.createdAt > last && it.id !in sessions.keys && !it.private }
                 pools.maxOfOrNull { it.createdAt }?.let { setSetting("last_pool_seen", it) }
-                pools.take(3).forEach { t -> emit("New coinjoin pool",
+                pools.asSequence().filter { firstNotice(it.id) }.take(3).forEach { t -> emit("New coinjoin pool",
                     "${sats(t.amount)} sats${if (t.script == ScriptType.P2TR) " · Taproot" else ""} · ${t.peers}/${t.maxPeers} people · ${t.feeRate} sat/vB", t.id) }
             }
         }, 20, 300, TimeUnit.SECONDS)
         Executors.newSingleThreadScheduledExecutor().scheduleWithFixedDelay({ runCatching { checkExact() } }, 30, 30, TimeUnit.SECONDS)
+    }
+
+    /**
+     * True the first time a pool is to be notified, and remembered (as the app since 1.2.5): its
+     * creator publishes it again on every change (someone joins, a vote) with a newer time, and
+     * each of those read as a new pool. Kept three days, longer than any pool stays open.
+     */
+    @Synchronized internal fun firstNotice(poolId: String, now: Long = System.currentTimeMillis() / 1000): Boolean {
+        val a = settings().optJSONObject("pools_notified") ?: JSONObject()
+        val kept = JSONObject()
+        for (k in a.keys()) if (a.optLong(k) > now - 3 * 86400) kept.put(k, a.optLong(k))
+        if (kept.has(poolId)) return false
+        kept.put(poolId, now); setSetting("pools_notified", kept)
+        return true
     }
 
     // ------------------------------------------------------------------ events

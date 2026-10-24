@@ -13,7 +13,7 @@ h1 { font-size:18px; color:var(--purple); margin:4px 0 10px; }
 .big { font-size:40px; font-weight:bold; color:var(--purple); word-break:break-all; }
 .mid { font-size:20px; color:var(--text); }
 .soft { color:var(--text-soft); } .faint { color:var(--faint); } .good { color:var(--good); } .warnc { color:var(--warn); } .badc { color:var(--bad); }
-.small { font-size:11px; } .center { text-align:center; } .mono { word-break:break-all; }
+.small { font-size:11px; } .center { text-align:center; } .right { text-align:right; } .accent { color:var(--purple); } .mono { word-break:break-all; }
 button { font:inherit; cursor:pointer; border-radius:12px; border:none; padding:12px 14px; font-weight:bold; letter-spacing:.5px; }
 button.primary { background:var(--purple); color:#000; } button.soft { background:var(--soft); color:var(--purple); border:1px solid var(--line); }
 button.link { background:none; color:var(--purple); padding:6px 8px; font-weight:normal; } button.link.faint { color:var(--faint); }
