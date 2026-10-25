@@ -44,6 +44,8 @@ object Spend {
         val cancels: Boolean = false,
         /** A cancellation: the outputs of the payment it cancels (addresses), which will never exist. */
         val cancelled: List<String> = emptyList(),
+        /** A send to several recipients: each (address, sats), the first being [toAddress]; empty for one. */
+        val recipients: List<Pair<String, Long>> = emptyList(),
     ) {
         val id: String = java.util.UUID.randomUUID().toString()
         val vbytes: Double get() = vsize(inputs, outputs.map { it.scriptPubKey })
@@ -74,14 +76,30 @@ object Spend {
      * that makes a perfect coin, as the app since 1.2.5).
      */
     fun plan(w: NodeWallet, utxos: List<NodeWallet.Utxo>, chosen: Set<String>, to: String, amount: Long?, rate: Double,
-             changeTo: NodeWallet = w): Draft =
-        planRaw(w, utxos, chosen, to, amount, rate, changeTo).also { it.changeType = changeTo.type }
+             changeTo: NodeWallet = w,
+             /** More recipients (address, sats) after [to], as the app's multi-recipient SEND: one transaction for all. */
+             extra: List<Pair<String, Long>> = emptyList()): Draft =
+        planRaw(w, utxos, chosen, to, amount, rate, changeTo, extra).also { it.changeType = changeTo.type }
+
+    private fun recipientScript(to: String): ByteArray {
+        val s = runCatching { Address.decodeToScriptPubKey(to.trim()) }.getOrElse { error("That is not a valid address: ${to.trim()}") }
+        require(s.isNotEmpty() && s[0] != 0x6a.toByte()) { "That address can't receive." }
+        return s
+    }
 
     private fun planRaw(w: NodeWallet, utxos: List<NodeWallet.Utxo>, chosen: Set<String>, to: String, amount: Long?, rate: Double,
-                        changeTo: NodeWallet): Draft {
+                        changeTo: NodeWallet, extra: List<Pair<String, Long>>): Draft {
         require(rate in 0.1..1000.0) { "The fee rate must be between 0.1 and 1000 sat/vB." }
-        val toScript = runCatching { Address.decodeToScriptPubKey(to.trim()) }.getOrElse { error("That is not a valid address.") }
-        require(toScript.isNotEmpty() && toScript[0] != 0x6a.toByte()) { "That address can't receive." }
+        val toScript = recipientScript(to)
+        require(amount != null || extra.isEmpty()) { "MAX sends everything to one recipient: remove the others, or type the amounts." }
+        require(extra.size < 50) { "Too many recipients for one send." }
+        val extraOuts = extra.map { (a, v) ->
+            require(v > DUST) { "The amount for ${a.trim()} is too small to send." }
+            TxBuilder.Output(recipientScript(a), v)
+        }
+        val scripts = listOf(toScript) + extraOuts.map { it.scriptPubKey }
+        require(scripts.map { it.toList() }.toSet().size == scripts.size) { "The same address twice: put it once with the whole amount." }
+        val recipients = if (extra.isEmpty()) emptyList() else listOf(to.trim() to (amount ?: 0L)) + extra.map { it.first.trim() to it.second }
         val pool = if (chosen.isEmpty()) utxos else utxos.filter { it.outpoint in chosen }
         require(pool.isNotEmpty()) { if (chosen.isEmpty()) "No coins to spend yet." else "Pick at least one coin." }
         val (changeIndex, changeScript) = changeTo.peekChange()
@@ -92,19 +110,21 @@ object Spend {
             return Draft(pool, listOf(TxBuilder.Output(toScript, send)), to.trim(), send, f, 0, null).also { it.type = w.type }
         }
         require(amount > DUST) { "The amount is too small to send." }
+        val total = amount + extraOuts.sumOf { it.value }
+        val outs = listOf(TxBuilder.Output(toScript, amount)) + extraOuts
         val picked = if (chosen.isNotEmpty()) pool else {
             val acc = mutableListOf<NodeWallet.Utxo>(); var s = 0L
-            for (u in pool) { acc += u; s += u.value; if (s >= amount + fee(acc, listOf(toScript, changeScript), rate)) break }
+            for (u in pool) { acc += u; s += u.value; if (s >= total + fee(acc, scripts + listOf(changeScript), rate)) break }
             acc
         }
         val sum = picked.sumOf { it.value }
-        val fWith = fee(picked, listOf(toScript, changeScript), rate)
-        val change = sum - amount - fWith
-        if (change > DUST) return Draft(picked, listOf(TxBuilder.Output(toScript, amount), TxBuilder.Output(changeScript, change)),
-            to.trim(), amount, fWith, change, changeIndex).also { it.type = w.type }
-        val fNo = fee(picked, listOf(toScript), rate)
-        require(sum - amount >= fNo) { "Not enough funds for $amount sats plus the fee." }
-        return Draft(picked, listOf(TxBuilder.Output(toScript, amount)), to.trim(), amount, sum - amount, 0, null).also { it.type = w.type }
+        val fWith = fee(picked, scripts + listOf(changeScript), rate)
+        val change = sum - total - fWith
+        if (change > DUST) return Draft(picked, outs + TxBuilder.Output(changeScript, change),
+            to.trim(), total, fWith, change, changeIndex, recipients = recipients).also { it.type = w.type }
+        val fNo = fee(picked, scripts, rate)
+        require(sum - total >= fNo) { "Not enough funds for $total sats plus the fee." }
+        return Draft(picked, outs, to.trim(), total, sum - total, 0, null, recipients = recipients).also { it.type = w.type }
     }
 
     /** RBF: the same inputs and recipients, the extra fee taken from our change. */

@@ -10,11 +10,12 @@ phone, that reads the chain straight from your own node — no Electrum server.
   (PBKDF2 600 000 rounds + AES-256-GCM) and asked for again before each send. Every input is signed
   with the unified sighash (0x21), so a spend can't be replayed on the SHA-256 chain.
 - **Watch-only wallets send through a PSBT**, checked on the way back like in the app.
-- Coin control, RBF, CPFP, a second confirmation for a fee that looks like a slip, contacts,
+- Several recipients in one send, coin control, RBF, CPFP, a second confirmation for a fee that looks like a slip, contacts,
   street mode, USD/EUR prices (optional).
 - **Coinjoin** (beta, opt-in): the app's COINJOIN tab, in the same pools as the app and
   [Kilojoin](https://github.com/Kilombino/kilojoin) (relay.kilombino.com, the app's own protocol
-  code). Open or join pools with one coin, ask to close, accept or refuse, sign after the server
+  code). Open a pool from whole coins with no change (or of an amount you type) or join one, pay up to five
+  recipients from SEND through a new pool (a payment pool, Kilojoin v5, when the amounts differ), ask to close, accept or refuse, sign after the server
   checks your output, change and fee; coins in a live round are left out of sends, and mixed coins
   are flagged so they are not spent together with others. Alerts through your own Telegram bot,
   a sound in the browser, StartOS notifications, and an optional sign-on-its-own. Native SegWit

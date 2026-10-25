@@ -319,6 +319,7 @@ function sendPanel() {
 
 function sendForm() {
   const f = S.form || (S.form = { to: '', amount: '', rate: '', max: false, coins: new Set() });
+  f.extra = f.extra || [];
   const to = h('input', { placeholder: 'recipient address', value: f.to, oninput: e => f.to = e.target.value.trim() });
   const amount = h('input', { placeholder: 'amount (sats)', inputmode: 'numeric', value: f.max ? '' : f.amount, disabled: f.max, oninput: e => f.amount = e.target.value.replace(/\D/g, '') });
   const rate = h('input', { placeholder: 'sat/vB', inputmode: 'decimal', value: f.rate, oninput: e => f.rate = e.target.value.replace(',', '.') });
@@ -333,6 +334,18 @@ function sendForm() {
       c.mixed ? h('span', { class: 'good' }, ' · mixed') : null, c.inRound ? h('span', { class: 'warnc' }, ' · in a coinjoin round') : null))));
   const coinNote = (S.w.coins || []).some(c => c.mixed) ? h('p', { class: 'faint small' }, 'Never spend a mixed coin together with other coins: that links them again.') : null;
   const cc = h('details', { open: f.coins.size > 0 }, h('summary', { class: 'soft small' }, 'Coin control'), coinNote, coinBox);
+  // More recipients, all paid by this one transaction (as the app's SEND).
+  const payBox = h('div', {});
+  const extraRows = f.extra.map((x, i) => h('div', {},
+    h('div', { class: 'row small soft mt' }, h('div', { class: 'grow' }, `recipient ${i + 2}`),
+      h('button', { class: 'link', onclick: async () => { try { x.to = (await navigator.clipboard.readText()).trim().replace(/^bitcoin:/i, '').split('?')[0]; render(); } catch { toast('Paste it into the box.'); } } }, 'PASTE'),
+      h('button', { class: 'link badc', onclick: () => { f.extra.splice(i, 1); render(); } }, '✕')),
+    h('div', { class: 'row' },
+      h('div', { class: 'grow' }, h('input', { placeholder: 'address', value: x.to, oninput: e => { x.to = e.target.value.trim(); payCheck(f, payBox); } })),
+      h('div', { class: 'w110' }, h('input', { placeholder: 'sats', inputmode: 'numeric', value: x.amount, oninput: e => { x.amount = e.target.value.replace(/\D/g, ''); e.target.value = x.amount; payCheck(f, payBox); } })))));
+  const addRecipient = f.max ? null : h('button', { class: 'link', onclick: () => { f.extra.push({ to: '', amount: '' }); render(); } }, '＋ ADD RECIPIENT');
+  [to, amount, rate].forEach(e => e.addEventListener('input', () => payCheck(f, payBox)));
+  payCheck(f, payBox);
   return h('div', {},
     h('div', { class: 'row' }, h('div', { class: 'grow' }, to), scan),
     h('div', { class: 'row' },
@@ -341,11 +354,58 @@ function sendForm() {
     h('div', { class: 'row small faint' }, h('div', { class: 'grow' }, 'amount (sats)'), h('div', { class: 'w110' }, 'fee sat/vB')),
     h('div', { class: 'row' }, h('div', { class: 'grow' }, amount), h('div', { class: 'w110' }, rate)),
     f.max ? null : h('div', { class: 'row' }, h('div', { class: 'grow' }, fiatBox(amount, v => f.amount = v)), h('div', { class: 'w110' })),
-    h('label', { class: 'check small' }, h('input', { type: 'checkbox', checked: f.max, onchange: e => { f.max = e.target.checked; render(); } }), 'MAX: send everything (minus the fee)'),
-    cc,
+    h('label', { class: 'check small' }, h('input', { type: 'checkbox', checked: f.max, onchange: e => { f.max = e.target.checked; if (f.max) f.extra = []; render(); } }), 'MAX: send everything (minus the fee)'),
+    extraRows, addRecipient,
+    cc, payBox,
     h('div', { class: 'btns' }, h('button', { class: 'primary', onclick: () => api('send/prepare', {
-      to: f.to, amount: Number(f.amount || 0), max: f.max, rate: Number(f.rate || 2), coins: [...f.coins] })
+      to: f.to, amount: Number(f.amount || 0), max: f.max, rate: Number(f.rate || 2), coins: [...f.coins],
+      extra: f.extra.map(x => ({ to: x.to, amount: Number(x.amount || 0) })) })
       .then(d => { S.draft = d; render(); }).catch(e => toast(e.message)) }, 'REVIEW')));
+}
+
+/**
+ * Paying through a new coinjoin pool (as the app since 1.2.7), offered under the recipients once
+ * every row is filled in: equal amounts of one address type make a pool of equal outputs going
+ * straight to the recipients; different ones (or by choice) a payment pool, Kilojoin v5.
+ */
+function payCheck(f, box) {
+  clearTimeout(payCheck.t);
+  const rows = [{ to: f.to, amount: f.amount }].concat(f.extra || []);
+  const filled = !f.max && rows.every(r => (r.to || '').trim() && Number(r.amount || 0) > 0);
+  const cj = C.st;
+  if (!filled || S.me.mode !== 'hot' || !cj || !cj.enabled || cj.blocker) { box.replaceChildren(); return; }
+  payCheck.t = setTimeout(async () => {
+    let c;
+    try { c = await api('coinjoin/pay/check', { recipients: rows.map(r => ({ to: r.to.trim(), amount: Number(r.amount) })) }); } catch { return; }
+    if (!c.any) return box.replaceChildren(h('p', { class: 'faint small mt' }, 'Pay through a coinjoin: not available. ' + (c.reason || '')));
+    box.replaceChildren(h('div', {},
+      h('div', { class: 'btns' }, h('button', { class: 'soft accent', onclick: () => payThroughPool(f, c, !c.ok) },
+        c.ok ? '🌀 PAY THROUGH A NEW COINJOIN POOL' : '🌀 PAY THROUGH A NEW PAYMENT POOL')),
+      h('p', { class: 'faint small' }, c.ok ? 'The payment goes out only when the pool closes, which can take hours. If it doesn\'t fill, nothing is paid and you can send normally.'
+        : 'Different amounts: the others in the pool each put in the same total and get it back in equal outputs. Your payments still show on the chain as odd amounts, and as one person\'s; which coins paid them stays hidden among the members (best when everyone uses perfect coins), and the others mix among themselves. It goes out only when the pool closes; if it doesn\'t fill, nothing is paid.'),
+      // Equal amounts can still go as a payment pool, if the user prefers it.
+      c.ok && c.paymentOk ? h('button', { class: 'link small', onclick: () => payThroughPool(f, c, true) }, 'or as a payment pool (the others get the total back in equal outputs)') : null));
+  }, 250);
+}
+
+/** SEND hands its payment to the coinjoin tab: a new pool's sheet for it, with BACK to SEND as it was. */
+function payThroughPool(f, c, v5) {
+  const rows = [{ to: f.to.trim(), amount: Number(f.amount) }].concat((f.extra || []).map(x => ({ to: x.to.trim(), amount: Number(x.amount) })));
+  const draft = { to: f.to, amount: f.amount, rate: f.rate, max: false, coins: new Set(f.coins), extra: (f.extra || []).map(x => ({ to: x.to, amount: x.amount })) };
+  const rate = Math.max(1, Number(String(f.rate || '1').replace(',', '.')) || 1);
+  const pay = { v5, recipients: rows, amounts: c.amounts, total: c.total, amount: c.amount, script: c.type, coins: [...f.coins], draft };
+  C.create = { pay, fromCoins: false, amount: String(v5 ? c.total : c.amount), rate: fmtRate(rate), min: '2', max: '5', hours: '6', inputs: '5',
+    outputs: v5 ? '1' : String(rows.length), password: '', script: c.type, picked: [] };
+  C.pick = null; C.join = null; C.chosen = [];
+  S.sheet = null; S.draft = null; S.form = null;
+  openTab('coinjoin');
+}
+
+/** BACK from a payment's pool sheet: SEND again, with the payment as it was typed and ticked. */
+function backToSend(pay) {
+  C.create = null; C.pick = null; C.chosen = [];
+  S.form = pay.draft; S.tab = 'btc'; S.sheet = 'send'; S.draft = null; S.sent = null; S.psbt = null;
+  render(); window.scrollTo(0, 0);
 }
 
 function reviewView(d) {
@@ -358,8 +418,10 @@ function reviewView(d) {
     d.cpfpParent ? h('p', { class: 'small soft' }, 'Pulls the stuck payment along: a payment to yourself that spends what it brought you, with a fee big enough for both.') : null,
     d.cancels ? h('p', { class: 'small warnc' }, 'Cancels the payment: the same coins go back to a fresh address of this wallet, paying a little more fee, so the recipients get nothing. If the payment confirms first, the cancellation is refused: the earlier, the better.')
       : d.replaces ? h('p', { class: 'small soft' }, 'Replaces the stuck send with the same payment and a higher fee, taken from your change.') : null,
+    (d.recipients || []).length ? (d.recipients || []).map((r, i) => h('div', { class: 'between' }, h('span', { class: 'soft' }, i ? `To (${i + 1})` : 'To (1)'),
+      h('span', { class: 'mono' }, short(r.to) + ' · ' + sats(r.amount)))) :
     h('div', { class: 'between' }, h('span', { class: 'soft' }, d.cpfpParent || d.cancels ? 'Back to you' : 'To'), h('span', { class: 'mono' }, short(d.to))),
-    h('div', { class: 'between' }, h('span', { class: 'soft' }, 'Amount'), h('span', {}, sats(d.amount) + ' sats')),
+    h('div', { class: 'between' }, h('span', { class: 'soft' }, (d.recipients || []).length ? 'Amount in all' : 'Amount'), h('span', {}, sats(d.amount) + ' sats')),
     h('div', { class: 'between' }, h('span', { class: 'soft' }, 'Fee'), h('span', {}, (d.replaces ? sats(d.replacedFee) + ' → ' : '') + sats(d.fee) + ' sats · ' +
       (d.cpfpParent ? d.packageRate.toFixed(1) + ' sat/vB both together' : d.rate.toFixed(1) + ' sat/vB'))),
     h('div', { class: 'between' }, h('span', { class: 'soft' }, 'Change'), h('span', {}, d.change && !d.cpfpParent ? sats(d.change) + ' sats' : '—')),
@@ -540,12 +602,6 @@ const cjType = () => (C.pick && C.pick.script) || (C.create && C.create.script) 
 const kindName = t => (t === 'p2tr' ? 'Taproot (bc1p)' : 'native SegWit (bc1q)');
 // o: mixed outputs each person gets (Kilojoin v4: 2 to 5; 1 before).
 const feeShare = (rate, withChange, n = 1, t = cjType(), o = 1) => Math.ceil(rate * (inVb(t) * n + outVb(t) * o + (withChange ? outVb(t) : 0) + 10.5 / 2));
-const minCoin = (amount, rate, o = 1) => amount * o + feeShare(rate, false, 1, cjType(), o);
-function cjChange(v, amount, rate, n = 1, o = 1) {
-  const w = v - amount * o - feeShare(rate, true, n, cjType(), o);
-  if (w > ((C.st && C.st.limits.dust) || 294)) return w;
-  return v - amount * o - feeShare(rate, false, n, cjType(), o) >= 0 ? 0 : null;
-}
 // "4 × 100 000" for a pool of several outputs each (v4), the plain amount otherwise.
 const amountOf = (amount, o) => (o > 1 ? o + ' × ' : '') + sats(amount);
 function left(at) {
@@ -630,7 +686,8 @@ function coinjoinView() {
     return h('div', {}, parts);
   }
   parts.push(h('div', { class: 'btns' }, h('button', { class: 'primary', onclick: () => {
-    C.create = { amount: '100000', rate: '1', min: '2', max: '5', hours: '6', inputs: '5', outputs: '1', password: '', script: C.st.segwit === false ? 'p2tr' : 'p2wpkh' }; render();
+    // From your coins (the default, as the app since 1.2.7): whole coins ticked, the amount worked out so there is no change.
+    C.create = { fromCoins: true, picked: [], amount: '100000', rate: '1', min: '2', max: '5', hours: '6', inputs: '5', outputs: '1', password: '', script: C.st.segwit === false ? 'p2tr' : 'p2wpkh' }; render();
   } }, '＋  OPEN A POOL')));
   parts.push(openPools(mine), intro, autoSignPanel(), destinationsPanel(), notificationsPanel(), howPanel());
   return h('div', {}, parts);
@@ -664,7 +721,7 @@ function phaseText(p) {
     case 'SIGNING': return `Ready: sign within ${left(p.phaseDeadline)}`;
     case 'BROADCAST': return 'Sent · waiting for the first confirmation';
     case 'CONFIRMED': return 'Confirmed ✅';
-    case 'ABORTED': return 'Cancelled: ' + p.reason + '. Your coin did not move.';
+    case 'ABORTED': return 'Cancelled: ' + p.reason + (p.pay ? '. Nothing was paid: send it normally if you like.' : '. Your coin did not move.');
     case 'REJECTED': return 'Refused: ' + p.reason;
   }
   return p.phase;
@@ -706,7 +763,10 @@ function myPool(p, embedded) {
     if (p.signed) acts.push(h('p', { class: 'soft small' }, `Signed. Waiting for the others (${p.sigs}/${p.planCoins || '?'} coins)…`));
     else {
       const pw = h('input', { type: 'password', placeholder: 'password, to sign', autocomplete: 'current-password' });
-      if (p.planPeople) acts.push(h('p', { class: 'small soft' }, `Checked: ${p.planPeople} people (${p.planCoins} coins), ${p.planIdentical} identical outputs of ${sats(p.amount)} sats, ${p.outputs > 1 ? p.outputs + ' of them' : 'one of them'} yours; ` +
+      if (p.planPeople) acts.push(h('p', { class: 'small soft' }, (p.v5 && p.creator
+        ? `Checked: ${p.planPeople} people (${p.planCoins} coins), the others' ${p.planIdentical} identical outputs of ${sats(p.amount)} sats and your ${p.planPayments} payment(s) exactly as announced; `
+        : `Checked: ${p.planPeople} people (${p.planCoins} coins), ${p.planIdentical} identical outputs of ${sats(p.amount)} sats, ${p.outputs > 1 ? p.outputs + ' of them' : 'one of them'} yours` +
+          (p.v5 ? `, the creator's ${p.planPayments} payment(s) as announced; ` : '; ')) +
         (p.change > 0 ? 'your change is right' : 'no change (an exact coin)') + `; total fee ${sats(p.planFee)} sats.`));
       acts.push(pw, h('div', { class: 'btns' }, h('button', { class: 'primary', onclick: () => cjAct('coinjoin/sign', { pool: p.id, password: pw.value }) }, 'SIGN')));
     }
@@ -715,17 +775,38 @@ function myPool(p, embedded) {
     h('div', { class: 'row' }, h('button', { class: 'link', onclick: () => window.open(S.w.settings.explorer + '/tx/' + p.txid, '_blank', 'noopener') }, 'open in explorer'),
       p.phase === 'CONFIRMED' ? h('button', { class: 'link faint', onclick: () => cjAct('coinjoin/remove', { pool: p.id }) }, 'remove') : null));
   if (['ABORTED', 'REJECTED'].includes(p.phase)) acts.push(h('button', { class: 'link faint', onclick: () => cjAct('coinjoin/remove', { pool: p.id }) }, 'remove'));
-  const coinLine = h('p', { class: 'faint small' }, `${p.coins > 1 ? 'your ' + p.coins + ' coins' : 'your coin'} ${sats(p.coinValue)} → ${amountOf(p.amount, p.outputs)} mixed${p.change > 0 ? ' + ' + sats(p.change) + ' change' : ''} · fee ${sats(p.coinValue - p.amount * (p.outputs || 1) - p.change)}`);
+  const coinLine = h('p', { class: 'faint small' }, seatLine(p));
+  // A payment through the pool (only on this server): to whom, and that nothing is paid until it closes.
+  const payLine = p.pay ? h('div', {}, h('p', { class: 'small accent' }, 'the payments go to: Payment recipients'),
+    p.recipients.map((r, i) => h('div', { class: 'tx', onclick: () => copy(r.address) },
+      h('div', { class: 'between' }, h('span', { class: 'soft small' }, `recipient ${i + 1}`), h('span', { class: 'small' }, sats(r.amount) + ' sats')),
+      h('div', { class: 'mono small' }, r.address))),
+    ['JOINING', 'OPEN', 'VOTING'].includes(p.phase) ? h('p', { class: 'faint small' }, 'A payment: it goes out only when the pool closes. If the pool doesn\'t fill, nothing is paid; cancel it and send normally.') : null) : null;
   // Only on this server: where the mixed outputs go when it is not this wallet.
-  const destLine = p.dest ? h('div', {}, h('p', { class: 'small accent' }, 'mixed outputs go to: ' + p.dest),
+  const destLine = p.pay ? payLine : p.dest ? h('div', {}, h('p', { class: 'small accent' }, 'mixed outputs go to: ' + p.dest),
     ['JOINING', 'ABORTED', 'REJECTED'].includes(p.phase) ? null : h('button', { class: 'link', onclick: () => showAddresses('This round\'s addresses',
       api('coinjoin/round/addresses', { pool: p.id }), 'The addresses of that wallet this round\'s mixed outputs go to, with their paths.') }, 'show the addresses')) : null;
   if (embedded) return h('div', { class: 'mt' }, coinLine, destLine, acts);
   return h('div', { class: 'panel' + (['VOTING', 'SIGNING'].includes(p.phase) ? ' warn' : ['ABORTED', 'REJECTED'].includes(p.phase) ? ' bad' : '') },
-    h('div', { class: 'between' }, h('span', { class: 'mid' }, amountOf(p.amount, p.outputs) + ' sats' + (p.script === 'p2tr' ? ' · Taproot' : '')), h('span', { class: 'faint small' }, (p.private ? '🔒 ' : '') + (p.creator ? 'your pool' : 'joined'))),
+    h('div', { class: 'between' }, h('span', { class: 'mid' }, roundTitle(p).replace(/ each$/, '') + (p.script === 'p2tr' ? ' · Taproot' : '')), h('span', { class: 'faint small' }, (p.private ? '🔒 ' : '') + (p.creator ? 'your pool' : 'joined'))),
     h('p', { class: cls + ' small' }, phaseText(p)),
-    h('p', { class: 'faint small' }, `${p.coins > 1 ? 'your ' + p.coins + ' coins' : 'your coin'} ${sats(p.coinValue)} → ${amountOf(p.amount, p.outputs)} mixed${p.change > 0 ? ' + ' + sats(p.change) + ' change' : ''} · fee ${sats(p.coinValue - p.amount * (p.outputs || 1) - p.change)}`),
-    destLine, acts);
+    coinLine, destLine, acts);
+}
+
+/** Your seat in a round: coins in, what comes out (the payments, for a payment pool's creator), change and fee. */
+function seatLine(p) {
+  const coins = p.coins > 1 ? 'your ' + p.coins + ' coins' : 'your coin';
+  const mixTotal = p.mixTotal || p.amount * (p.outputs || 1);
+  const out = p.v5 && p.creator ? `${sats(mixTotal)} paid to ${(p.payments || []).length} recipient(s)` : amountOf(p.amount, p.outputs) + ' mixed';
+  const fee = sats(p.coinValue - mixTotal - p.change);
+  return `${coins} ${sats(p.coinValue)} → ${out}` + (p.change > 0 ? ` + ${sats(p.change)} change · fee ${fee}` : ` · fee ${fee}`);
+}
+
+/** What kind of pool: v5 payment pool, v4 several outputs, v3 blind outputs. */
+function poolKindLine(t) {
+  if (t.v5) return ' · ' + (t.outputs > 1 ? `a payment pool (v5): the creator pays ${(t.payments || []).length} recipient(s); you get ${sats(t.mixTotal)} in ${t.outputs} equal outputs`
+    : `a payment pool (v5): the creator pays ${(t.payments || []).length} recipient(s); you get ${sats(t.mixTotal)} in one output`);
+  return t.outputs > 1 ? ' · ' + t.outputs + ' outputs each (v4)' : t.version >= 3 ? ' · blind outputs (v3)' : '';
 }
 
 function openPools(mine) {
@@ -739,7 +820,7 @@ function openPools(mine) {
       shown.length ? shown.map(t => h('div', { class: 'panel' }, h('div', { class: 'row' },
         h('div', { class: 'grow' },
           h('div', { class: 'mid' }, (t.private ? '🔒 ' : '') + amountOf(t.amount, t.outputs) + ' sats'),
-          h('div', { class: t.script === 'p2tr' ? 'good small' : 'soft small' }, `${kindName(t.script)} coins only · ${t.maxInputs > 1 ? 'up to ' + t.maxInputs + ' coins each' : 'one coin each'}${t.outputs > 1 ? ' · ' + t.outputs + ' outputs each (v4)' : t.version >= 3 ? ' · blind outputs (v3)' : ''}`),
+          h('div', { class: t.script === 'p2tr' ? 'good small' : 'soft small' }, `${kindName(t.script)} coins only · ${t.maxInputs > 1 ? 'up to ' + t.maxInputs + ' coins each' : 'one coin each'}` + poolKindLine(t)),
           h('div', { class: 'soft small' }, `${t.peers}/${t.maxPeers} people (min ${t.minPeers}) · ${t.feeRate} sat/vB · closes in ${left(t.expiresAt)}`),
           h('div', { class: 'faint small' }, `joining costs you ${sats(t.feeWithChange)} sats in fees with one coin (${sats(t.feeNoChange)} with a coin of exactly ${sats(t.amount * (t.outputs || 1) + t.feeNoChange)})`),
           t.joinable ? null : h('div', { class: 'warnc small' }, `This wallet's coins are ${kindName(cjType())}: it can't join this pool.`)),
@@ -747,68 +828,193 @@ function openPools(mine) {
         : h('p', { class: 'faint small' }, 'No open pools right now. Open one and others will be notified.'));
 }
 
-function createError(f) {
-  const L = C.st.limits;
-  const amount = Number(f.amount.replace(/\D/g, '')), rate = Number(f.rate.replace(',', '.')), max = Number(f.max), min = Number(f.min), hours = Number(f.hours);
-  if (!f.amount || !Number.isInteger(amount) || amount < L.minAmount || amount > L.maxAmount) return `Amount: ${sats(L.minAmount)} to ${sats(L.maxAmount)} sats (1 BTC).`;
-  if (!f.rate || !isFinite(rate) || rate < 1 || rate > 500) return 'Fee: 1 to 500 sat/vB.';
-  if (!Number.isInteger(max) || max < L.minPeers || max > L.maxPeers) return `Most people: ${L.minPeers} to ${L.maxPeers}.`;
-  if (!Number.isInteger(min) || min < L.minPeers || min > max) return `Fewest people: ${L.minPeers} to ${max} (the most).`;
-  if (!Number.isInteger(hours) || hours < 1 || hours > 72) return 'Open for 1 to 72 hours.';
-  const ins = Number(f.inputs);
-  if (!Number.isInteger(ins) || ins < 1 || ins > 10) return 'Coins per person: 1 to 10.';
-  const outs = Number(f.outputs);
-  if (!Number.isInteger(outs) || outs < 1 || outs > 5) return 'Mixed outputs per person: 1 to 5.';
-  return null;
+// v5: how a joiner gets the payments' total back: the outputs asked for when it splits evenly
+// into outputs of at least the smallest one, else one output of the whole total (Protocol.v5Split).
+function v5Split(total, wanted) {
+  const minOut = (C.st && C.st.limits.testMinAmount) || 1000;
+  return wanted >= 2 && wanted <= 5 && total % wanted === 0 && total / wanted >= minOut ? [total / wanted, wanted] : [total, 1];
+}
+// The amount of each output for a pool opened from whole coins, so they go in with no change (CoinjoinTx.noChangeAmount).
+function noChangeAmount(total, n, rate, t, o) {
+  const left = total - feeShare(rate, false, n, t, o);
+  return left <= 0 || o < 1 ? null : Math.floor(left / o);
+}
+// The coins of a pool's type that can go in: confirmed, not in a round already.
+const poolCoins = t => (C.st.coins || []).filter(c => !c.inRound && c.confirmations > 0 && (c.type || 'p2wpkh') === t);
+
+/** What the create form works out: the amount per output, the outputs each, and why it can't open yet. */
+function createPlan(f) {
+  const L = C.st.limits, t = f.script || 'p2wpkh';
+  const rate = Number(String(f.rate).replace(',', '.')), max = Number(f.max), min = Number(f.min), hours = Number(f.hours), ins = Number(f.inputs);
+  const rateOk = f.rate !== '' && isFinite(rate) && rate >= 1 && rate <= 500;
+  const pay = f.pay, v5 = pay && pay.v5;
+  const split = v5 ? v5Split(pay.total, Number(f.outputs) || 1) : null;
+  const o = split ? split[1] : Number(f.outputs);
+  const outsOk = Number.isInteger(o) && o >= 1 && o <= L.maxOutputs;
+  const picked = poolCoins(t).filter(c => (f.picked || []).includes(c.outpoint));
+  const total = picked.reduce((a, c) => a + c.value, 0);
+  const amount = split ? split[0] : pay ? pay.amount : !f.fromCoins ? Number(String(f.amount).replace(/\D/g, '')) || null
+    : !picked.length || !rateOk || !outsOk ? null : noChangeAmount(total, picked.length, rate, t, o);
+  const err = (() => {
+    if (f.fromCoins && !rateOk) return 'Fee: 1 to 500 sat/vB.';
+    if (f.fromCoins && !outsOk) return `Mixed outputs per person: 1 to ${L.maxOutputs}.`;
+    if (f.fromCoins && !picked.length) return 'Tick the coins to put in.';
+    if (f.fromCoins && (!Number.isInteger(ins) || ins < 1 || ins > L.maxInputs)) return `Coins per person: 1 to ${L.maxInputs}.`;
+    if (f.fromCoins && picked.length > ins) return `You ticked ${picked.length} coins: set the most coins per person to at least ${picked.length}.`;
+    if (f.fromCoins && (amount == null || amount < L.testMinAmount || amount * o < L.minAmount))
+      return `These coins make ${sats(Math.max(0, amount || 0) * o)} sats in all: a pool takes at least ${sats(L.minAmount)} each, and ${sats(L.testMinAmount)} per output.`;
+    if (f.fromCoins && amount > L.maxAmount) return `These coins make ${sats(amount)} sats per output: a pool takes at most ${sats(L.maxAmount)} (1 BTC). Tick fewer coins or give more outputs.`;
+    if (!amount || !Number.isInteger(amount) || amount < L.testMinAmount || amount > L.maxAmount) return `Amount per output: ${sats(L.testMinAmount)} to ${sats(L.maxAmount)} sats (1 BTC).`;
+    if (outsOk && amount * o < L.minAmount) return `${sats(amount)} × ${o} = ${sats(amount * o)} sats each: a pool takes at least ${sats(L.minAmount)} each in all.`;
+    if (!rateOk) return 'Fee: 1 to 500 sat/vB.';
+    if (!Number.isInteger(max) || max < L.minPeers || max > L.maxPeers) return `Most people: ${L.minPeers} to ${L.maxPeers}.`;
+    if (!Number.isInteger(min) || min < L.minPeers || min > max) return `Fewest people: ${L.minPeers} to ${max} (the most).`;
+    if (!Number.isInteger(hours) || hours < 1 || hours > 72) return 'Open for 1 to 72 hours.';
+    if (!Number.isInteger(ins) || ins < 1 || ins > L.maxInputs) return `Coins per person: 1 to ${L.maxInputs}.`;
+    if (!outsOk) return `Mixed outputs per person: 1 to ${L.maxOutputs}.`;
+    return null;
+  })();
+  return { t, rate, rateOk, o, outsOk, split, amount, picked, total, err };
 }
 
 function createForm() {
   const f = C.create, L = C.st.limits;
+  if (f.confirm) return createConfirm();
+  const pay = f.pay, v5 = pay && pay.v5;
   const errBox = h('p', { class: 'warnc small' });
   const btc = h('div', { class: 'faint small' });
   const costs = h('p', { class: 'faint small' });
   const pwNote = h('p', { class: 'faint small' });
-  const next = h('button', { class: 'primary' }, 'CHOOSE COINS');
+  const splitNote = h('div', {});
+  const coinsSum = h('div', {});
+  const next = h('button', { class: 'primary' }, f.fromCoins ? 'CONTINUE' : pay && pay.coins.length ? 'CONTINUE WITH YOUR COINS' : 'CHOOSE COINS');
   const amountLabel = h('div', { class: 'soft small mt' }), outNote = h('p', { class: 'faint small' });
   const update = () => {
-    const e = createError(f);
-    errBox.textContent = e || ''; next.disabled = !!e;
-    const amount = Number(f.amount.replace(/\D/g, '')), rate = Number(f.rate.replace(',', '.'));
-    const o = Math.min(5, Math.max(1, Number(f.outputs) || 1));
+    const P = createPlan(f);
+    errBox.textContent = P.err || ''; next.disabled = !!P.err;
+    const amount = P.amount, rate = P.rate, o = Math.min(5, Math.max(1, P.o || 1)), t = P.t;
     amountLabel.textContent = o > 1 ? 'amount of each output (sats)' : 'amount per person (sats)';
-    outNote.textContent = o > 1 ? `Each person gets ${o} mixed outputs of the amount below, each to an unused address of their own. Only Kilowallet 1.2.0 or newer (Kilojoin v4) sees this pool.`
-      : 'One mixed output each: every Kilojoin v3 wallet can join it.';
-    btc.textContent = amount ? '= ' + (amount / 1e8).toFixed(8) + ' BTC' + (o > 1 ? ` · ${sats(amount * o)} sats per person in all` : '') : '';
-    costs.textContent = amount && rate >= 1 && rate <= 500 ? `A ${kindName(cjType())} pool (this wallet's type): only such coins can join, and every output is of that type. ` +
+    outNote.textContent = o > 1 ? (f.fromCoins ? `Each person gets ${o} mixed outputs of the pool's amount, each to an unused address of their own. ` : `Each person gets ${o} mixed outputs of the amount below, each to an unused address of their own. `) +
+      'Only Kilowallet 1.2.0 or newer (Kilojoin v4) sees this pool.' : 'One mixed output each: every Kilojoin v3 wallet can join it.';
+    btc.textContent = amount && !f.fromCoins ? '= ' + (amount / 1e8).toFixed(8) + ' BTC' + (o > 1 ? ` · ${sats(amount * o)} sats per person in all` : '') : '';
+    if (v5) {
+      const wanted = Number(f.outputs) || 1;
+      splitNote.replaceChildren(h('div', {}, h('p', { class: 'faint small' }, P.split[1] > 1 ? `The others get ${sats(pay.total)} sats back as ${P.split[1]} × ${sats(P.split[0])}.` : `The others get ${sats(pay.total)} sats back as one output.`),
+        wanted > 1 && P.split[1] === 1 ? h('p', { class: 'warnc small' }, `It doesn't split evenly into ${wanted} outputs of at least ${sats(L.testMinAmount)} sats: one output each.`) : null));
+    }
+    if (f.fromCoins) {
+      const fee = P.picked.length && P.rateOk && P.outsOk ? feeShare(rate, false, P.picked.length, t, P.o) : null;
+      coinsSum.replaceChildren(h('div', {}, P.picked.length && amount > 0 && fee != null ? h('div', {},
+        h('p', { class: (P.err ? 'warnc' : 'good') + ' mid' }, P.o > 1 ? `Pool of ${P.o} × ${sats(amount)} sats · change 0` : `Pool of ${sats(amount)} sats per output · change 0`),
+        h('p', { class: 'faint small' }, `${P.picked.length} coin(s), ${sats(P.total)} sats · fee ${sats(fee)} sats` + (P.total - fee - amount * P.o > 0 ? ` · ${P.total - fee - amount * P.o} sats of rounding to the miners` : ''))) : null,
+        P.picked.filter(c => c.mixed).length && P.picked.length > 1 ? h('p', { class: 'warnc small' }, 'A mixed coin in one seat with other coins ties them together: the round shows they are one person\'s. Remix mixed coins one at a time.') : null));
+    }
+    costs.textContent = !f.fromCoins && !v5 && amount && rate >= 1 && rate <= 500 ? `A ${kindName(t)} pool: only such coins can join, and every output is of that type. ` +
       'Blind outputs (Kilojoin v3): when the round closes, nobody, not even you as its creator, can tell whose mixed output is whose. ' +
-      `Each person pays their own fee, the same however many join: with one coin ${feeShare(rate, true, 1, cjType(), o)} sats with change, ${feeShare(rate, false, 1, cjType(), o)} without; each extra coin adds ${Math.ceil(rate * inVb(cjType()))}. ` +
-      `A coin of exactly ${sats(amount * o + feeShare(rate, false, 1, cjType(), o))} sats leaves no change (the best for privacy); a bit more than that, up to ${sats(amount * o + feeShare(rate, true, 1, cjType(), o) + L.dust)}, also goes in without change and the rest goes to the miners.` : '';
+      `Each person pays their own fee, the same however many join: with one coin ${feeShare(rate, true, 1, t, o)} sats with change, ${feeShare(rate, false, 1, t, o)} without; each extra coin adds ${Math.ceil(rate * inVb(t))}. ` +
+      `A coin of exactly ${sats(amount * o + feeShare(rate, false, 1, t, o))} sats leaves no change (the best for privacy); a bit more than that, up to ${sats(amount * o + feeShare(rate, true, 1, t, o) + L.dust)}, also goes in without change and the rest goes to the miners.` : '';
     pwNote.textContent = f.password ? 'Only people you give this password to can join. It is not announced anywhere.' : '';
   };
   const field = (label, k, mode) => [h('div', { class: 'soft small mt' }, label),
     h('input', { value: f[k], inputmode: mode, oninput: e => { f[k] = e.target.value; update(); } })];
   next.addEventListener('click', () => {
-    if (createError(f)) return;
-    C.pick = { title: 'Your coins for the pool', amount: Number(f.amount.replace(/\D/g, '')), rate: Number(f.rate.replace(',', '.')), maxInputs: Number(f.inputs), script: f.script,
-      outputs: Number(f.outputs) || 1 }; C.chosen = []; render();
+    const P = createPlan(f);
+    if (P.err) return;
+    // From your coins: no coin picker, the coins are ticked here; then where the outputs go and the password.
+    if (f.fromCoins) { f.confirm = true; render(); return; }
+    C.pick = { title: pay ? 'Your coins for the payment' : 'Your coins for the pool', amount: P.amount, rate: P.rate, maxInputs: Number(f.inputs), script: P.t,
+      outputs: P.o, pay, feeOutputs: v5 ? pay.amounts.length : P.o };
+    // Coins ticked in SEND: those that can go in are ticked here too.
+    C.chosen = pay ? poolCoins(P.t).filter(c => pay.coins.includes(c.outpoint)).slice(0, Number(f.inputs)).map(c => c.outpoint) : [];
+    C.pick.leftOut = pay ? pay.coins.length - C.chosen.length : 0;
+    render();
   });
+  const back = h('button', { class: 'soft', onclick: () => { if (pay) backToSend(pay); else { C.create = null; render(); } } }, pay ? 'BACK' : 'CANCEL');
+  // The payment as SEND had it: what is paid, to whom.
+  const payHead = !pay ? null : v5 ? h('div', {},
+    h('div', { class: 'mid' }, `${sats(pay.total)} sats to ${pay.amounts.length} recipient(s)`),
+    pay.recipients.map(r => h('div', { class: 'accent small mono' }, short(r.to) + ' · ' + sats(r.amount) + ' sats')),
+    h('p', { class: 'faint small' }, kindName(pay.script).replace(/^n/, 'N') + ' pool · a payment pool (v5)'),
+    h('p', { class: 'small soft' }, `A new payment pool opens: each of the others puts in ${sats(pay.total)} sats too and gets it back in equal outputs, while your outputs are the payments. On the chain the payments show as odd amounts, and as one person's; which coins paid them stays hidden among the members, best when everyone uses perfect coins. The payment only goes out when the pool closes, which can take hours. If it doesn't fill, nothing is paid and your coins stay here: you can cancel it and send normally.`),
+    field(`outputs for each of the others (1–${L.maxOutputs})`, 'outputs', 'numeric'), splitNote)
+    : h('div', {},
+      h('div', { class: 'mid' }, pay.recipients.length > 1 ? `${pay.recipients.length} recipients × ${sats(pay.amount)} sats` : `${sats(pay.amount)} sats to 1 recipient`),
+      pay.recipients.map(r => h('div', { class: 'accent small mono' }, short(r.to))),
+      h('p', { class: 'faint small' }, kindName(pay.script).replace(/^n/, 'N') + ' pool · one output per recipient'),
+      h('p', { class: 'small soft' }, 'A new pool of exactly this amount opens, and its outputs for you go straight to the recipients: on the chain the payment looks like any other output of the round. The payment only goes out when the pool closes, which can take hours. If it doesn\'t fill, nothing is paid and your coins stay here: you can cancel it and send normally.'));
+  // From your coins: whole coins ticked, the pool's amount worked out from them.
+  const coinList = () => {
+    const list = poolCoins(f.script || 'p2wpkh');
+    if (!list.length) return h('p', { class: 'warnc small' }, `No confirmed ${kindName(f.script || 'p2wpkh')} coin.`);
+    return list.map(c => {
+      const sel = (f.picked || []).includes(c.outpoint);
+      return h('div', { class: 'pick' + (sel ? ' sel' : ''), onclick: () => {
+        f.picked = sel ? f.picked.filter(x => x !== c.outpoint) : (f.picked.length < L.maxInputs ? f.picked.concat(c.outpoint) : f.picked); render();
+      } }, h('div', { class: 'between' }, h('span', {}, sats(c.value) + ' sats' + (c.mixed ? ' · mixed' : '')), sel ? h('span', { class: 'good' }, '✓') : null),
+        h('div', { class: 'faint small' }, c.address ? c.address.slice(0, 10) + '…' + c.address.slice(-8) : c.outpoint.slice(0, 10) + '…'));
+    });
+  };
   update();
-  return h('div', { class: 'panel' }, h('div', { class: 'label' }, 'Open a pool'),
-    (C.st.taproot && C.st.segwit) ? h('div', {}, h('div', { class: 'soft small mt' }, "address type: every coin, mixed output and change of the pool is of it"),
-      h('select', { onchange: e => { f.script = e.target.value; update(); } },
-        h('option', { value: 'p2wpkh', selected: f.script !== 'p2tr' }, 'Native SegWit (bc1q)'),
-        h('option', { value: 'p2tr', selected: f.script === 'p2tr' }, 'Taproot (bc1p)'))) : null,
-    field('mixed outputs per person (1–5)', 'outputs', 'numeric'), outNote,
-    amountLabel, h('input', { value: f.amount, inputmode: 'numeric', oninput: e => { f.amount = e.target.value; update(); } }), btc,
+  return h('div', { class: 'panel' }, h('div', { class: 'label' }, pay ? 'Pay through a coinjoin' : 'Open a pool'),
+    payHead,
+    pay ? null : h('div', {},
+      h('div', { class: 'soft small mt' }, 'Pool amount'),
+      [[true, 'From your coins: tick them, no change (the best for privacy)'], [false, 'Type the amount']].map(([v, label]) => h('label', { class: 'check small' },
+        h('input', { type: 'radio', name: 'cjfrom', checked: !!f.fromCoins === v, onchange: () => { f.fromCoins = v; render(); } }), h('span', {}, label))),
+      (C.st.taproot && C.st.segwit) ? h('div', {}, h('div', { class: 'soft small mt' }, "address type: every coin, mixed output and change of the pool is of it"),
+        h('select', { onchange: e => { f.script = e.target.value; f.picked = []; render(); } },
+          h('option', { value: 'p2wpkh', selected: f.script !== 'p2tr' }, 'Native SegWit (bc1q)'),
+          h('option', { value: 'p2tr', selected: f.script === 'p2tr' }, 'Taproot (bc1p)'))) : null,
+      field(`mixed outputs per person (1–${L.maxOutputs})`, 'outputs', 'numeric'), outNote,
+      f.fromCoins ? null : [amountLabel, h('input', { value: f.amount, inputmode: 'numeric', oninput: e => { f.amount = e.target.value; update(); } }), btc]),
     field('fee rate (sat/vB)', 'rate', 'decimal'),
+    f.fromCoins ? h('div', {}, h('div', { class: 'label mt' }, 'Your coins'),
+      h('p', { class: 'small soft' }, 'Tick whole coins: the pool\'s amount is worked out from them so they go in with no change at all. The others join with coins of their own.'),
+      coinList(), coinsSum) : null,
     field(`fewest people to close (${L.minPeers}–${L.maxPeers - 1})`, 'min', 'numeric'),
     field(`most people (${L.minPeers}–${L.maxPeers})`, 'max', 'numeric'),
     field('open for (hours)', 'hours', 'numeric'),
-    field('most coins per person (1–10)', 'inputs', 'numeric'),
+    field(`most coins per person (1–${L.maxInputs})`, 'inputs', 'numeric'),
+    v5 ? h('p', { class: 'faint small' }, 'Only Kilowallet 1.2.7 or newer (Kilojoin v5) sees this pool.') : null,
     h('div', { class: 'soft small mt' }, 'password (optional: makes it private 🔒)'),
     h('input', { value: f.password, autocomplete: 'off', oninput: e => { f.password = e.target.value; update(); } }), pwNote,
     costs, errBox,
-    h('div', { class: 'btns' }, h('button', { class: 'soft', onclick: () => { C.create = null; render(); } }, 'CANCEL'), next));
+    h('div', { class: 'btns' }, back, next));
+}
+
+/** A pool from your coins: where the mixed outputs go (when there is more than this wallet), and the password. */
+function createConfirm() {
+  const f = C.create, P = createPlan(f);
+  const dests = (C.st.destinations || []).filter(d => d.type === P.t && !d.scanning);
+  if (!dests.some(d => d.id === C.dest)) C.dest = '';
+  const pw = h('input', { type: 'password', placeholder: 'password, to put your coins in', autocomplete: 'current-password' });
+  const open = h('button', { class: 'primary', disabled: !!P.err }, 'OPEN THE POOL');
+  open.addEventListener('click', async () => {
+    open.disabled = true;
+    try {
+      const r = await api('coinjoin/create', { coins: P.picked.map(c => c.outpoint), script: P.t, maxInputs: Number(f.inputs), outputs: P.o, fromCoins: true, amount: P.amount,
+        feeRate: P.rate, minPeers: Number(f.min), maxPeers: Number(f.max), hours: Number(f.hours), poolPassword: f.password, password: pw.value, dest: C.dest || '' });
+      C.create = null; C.cjTab = 1; toast(`Pool opened (${amountOf(r.amount, r.outputs)} sats, no change): others are told about it.`);
+      await loadCoinjoin(); render(); reloadPools();
+    } catch (e) { open.disabled = false; toast(e.message); }
+  });
+  return h('div', { class: 'panel' }, h('div', { class: 'label' }, 'Open a pool from your coins'),
+    h('p', { class: 'good mid' }, P.o > 1 ? `Pool of ${P.o} × ${sats(P.amount)} sats · change 0` : `Pool of ${sats(P.amount)} sats per output · change 0`),
+    h('p', { class: 'faint small' }, `${P.picked.length} coin(s), ${sats(P.total)} sats · fee ${sats(feeShare(P.rate, false, P.picked.length, P.t, P.o))} sats`),
+    destChooser(dests, P.t, P.o),
+    pw,
+    h('div', { class: 'btns' }, h('button', { class: 'soft', onclick: () => { f.confirm = false; render(); } }, 'BACK'), open));
+}
+
+/** Where the mixed outputs go, when there is more than this wallet to choose from. */
+function destChooser(dests, t, o) {
+  if (!dests.length) return null;
+  return h('div', {}, h('div', { class: 'soft small mt' }, 'Mixed outputs go to'),
+    [{ id: '', label: 'This wallet (default)' }].concat(dests).map(d => h('label', { class: 'check small' },
+      h('input', { type: 'radio', name: 'cjdest', checked: C.dest === d.id, onchange: () => { C.dest = d.id; render(); } }), h('span', {}, d.which || d.label))),
+    C.dest ? h('p', { class: 'faint small' }, "Unused receive addresses of that wallet; the change, if any, comes back here. Nobody in the round can tell: an output is just an address of the pool's type.") : null,
+    C.dest ? h('button', { class: 'link', onclick: () => showAddresses('Where the mixed outputs go', api('coinjoin/dest/preview', { dest: C.dest, script: t, outputs: o }),
+      'The unused receive addresses of that wallet the mixed outputs would go to now, one per output. Compare them with that wallet (Sparrow, Shrike: Addresses › Receive) before joining.') }, 'SHOW THE ADDRESSES') : null);
 }
 
 function cancelPick() {
@@ -817,32 +1023,36 @@ function cancelPick() {
 }
 
 function coinPicker() {
-  const k = C.pick, maxIn = k.maxInputs || 1, o = k.outputs || 1, exact = minCoin(k.amount, k.rate, o);
-  const coins = (C.st.coins || []).filter(c => !c.inRound && c.confirmations > 0 && (c.type || 'p2wpkh') === cjType());
+  const k = C.pick, maxIn = k.maxInputs || 1, o = k.outputs || 1, t = cjType();
+  // A payment through the pool: its outputs go to the recipients; a payment pool's creator pays a fee share for its payments.
+  const pay = k.pay, v5 = pay && pay.v5, fo = k.feeOutputs || o;
+  const mixTotal = k.amount * o, exact = mixTotal + feeShare(k.rate, false, 1, t, fo);
+  const changeOf = (v, n) => {
+    const w = v - mixTotal - feeShare(k.rate, true, n, t, fo);
+    if (w > ((C.st && C.st.limits.dust) || 294)) return w;
+    return v - mixTotal - feeShare(k.rate, false, n, t, fo) >= 0 ? 0 : null;
+  };
+  const coins = poolCoins(t);
   const ok = coins.filter(c => maxIn > 1 || c.value >= exact).sort((a, b) => (a.value === exact ? 0 : 1) - (b.value === exact ? 0 : 1) || b.value - a.value);
-  const short = maxIn > 1 ? [] : coins.filter(c => c.value >= k.amount * o && c.value < exact).sort((a, b) => b.value - a.value);
+  const short = maxIn > 1 ? [] : coins.filter(c => c.value >= mixTotal && c.value < exact).sort((a, b) => b.value - a.value);
   const pw = h('input', { type: 'password', placeholder: 'password, to put your coins in', autocomplete: 'current-password' });
   const poolPw = C.join && C.join.pool.private ? h('input', { placeholder: 'pool password', autocomplete: 'off', value: C.join.password, oninput: e => { C.join.password = e.target.value; } }) : null;
   const total = coins.filter(c => C.chosen.includes(c.outpoint)).reduce((a, c) => a + c.value, 0);
-  const ch = C.chosen.length ? cjChange(total, k.amount, k.rate, C.chosen.length, o) : null;
-  const use = h('button', { class: 'primary', disabled: ch === null }, C.create ? 'OPEN POOL' : 'JOIN');
-  // Where the mixed outputs go: this wallet by default; another one only when set up and of the pool's type.
-  const dests = (C.st.destinations || []).filter(d => d.type === cjType() && !d.scanning);
+  const ch = C.chosen.length ? changeOf(total, C.chosen.length) : null;
+  const use = h('button', { class: 'primary', disabled: ch === null }, pay ? 'OPEN THE POOL' : C.create ? 'OPEN POOL' : 'JOIN');
+  // Where the mixed outputs go: this wallet by default; another one only when set up and of the pool's type (never for a payment).
+  const dests = pay ? [] : (C.st.destinations || []).filter(d => d.type === t && !d.scanning);
   if (!dests.some(d => d.id === C.dest)) C.dest = '';
-  const destPick = dests.length ? h('div', {}, h('div', { class: 'soft small mt' }, 'Mixed outputs go to'),
-    [{ id: '', label: 'This wallet (default)' }].concat(dests).map(d => h('label', { class: 'check small' },
-      h('input', { type: 'radio', name: 'cjdest', checked: C.dest === d.id, onchange: () => { C.dest = d.id; render(); } }), h('span', {}, d.which || d.label))),
-    C.dest ? h('p', { class: 'faint small' }, "Unused receive addresses of that wallet; the change, if any, comes back here. Nobody in the round can tell: an output is just an address of the pool's type.") : null,
-    C.dest ? h('button', { class: 'link', onclick: () => showAddresses('Where the mixed outputs go', api('coinjoin/dest/preview', { dest: C.dest, script: cjType(), outputs: o }),
-      'The unused receive addresses of that wallet the mixed outputs would go to now, one per output. Compare them with that wallet (Sparrow, Shrike: Addresses › Receive) before joining.') }, 'SHOW THE ADDRESSES') : null) : null;
+  const destPick = destChooser(dests, t, o);
   const submit = async () => {
     use.disabled = true;
     try {
       if (C.create) {
         const f = C.create;
-        await api('coinjoin/create', { coins: C.chosen, script: cjType(), maxInputs: maxIn, outputs: o, amount: k.amount, feeRate: k.rate, minPeers: Number(f.min), maxPeers: Number(f.max),
-          hours: Number(f.hours), poolPassword: f.password, password: pw.value, dest: C.dest || '' });
-        C.create = null; toast('Pool opened: others are told about it.');
+        await api('coinjoin/create', { coins: C.chosen, script: t, maxInputs: maxIn, outputs: pay ? Number(f.outputs) || 1 : o, amount: k.amount, feeRate: k.rate, minPeers: Number(f.min), maxPeers: Number(f.max),
+          hours: Number(f.hours), poolPassword: f.password, password: pw.value, dest: C.dest || '',
+          pay: pay ? pay.recipients : undefined, paymentPool: !!v5 });
+        C.create = null; C.cjTab = 1; toast(pay ? 'Pool opened: the payment goes out when it closes.' : 'Pool opened: others are told about it.');
       } else {
         if (C.join.pool.private && !C.join.password) { use.disabled = false; return toast('Type the pool\'s password first.'); }
         await api('coinjoin/join', { pool: C.join.pool.id, coins: C.chosen, poolPassword: C.join.password, password: pw.value, dest: C.dest || '' });
@@ -853,13 +1063,13 @@ function coinPicker() {
     } catch (e) { use.disabled = false; toast(e.message); }
   };
   use.addEventListener('click', () => {
-    // With change, offer the perfect coin first: a coin of exactly the amount plus the fee joins with none.
-    if (ch > 0) {
+    // With change, offer the perfect coin first: a coin of exactly the amount plus the fee joins with none (not for a payment).
+    if (ch > 0 && !pay) {
       let m;
       m = modal(h('div', { class: 'label' }, 'Make the perfect coin?'),
         h('p', { class: 'small soft' }, `With ${C.chosen.length > 1 ? 'these ' + C.chosen.length + ' coins' : 'this coin'} you get ${sats(ch)} sats of change back, and that change shows on the chain next to your coins. A single coin of exactly ${sats(exact)} sats goes in with no change at all, so nothing ties your mixed output to anything. You can make it now: a payment to yourself, paid with the coins you tick, which needs one confirmation before it can join.`),
         h('div', { class: 'btns' }, h('button', { class: 'soft', onclick: () => { m.remove(); submit(); } }, 'NOT NEEDED, CONTINUE'),
-          h('button', { class: 'primary', onclick: () => { m.remove(); prepareExact(exact, cjType()); } }, 'MAKE THE PERFECT COIN')));
+          h('button', { class: 'primary', onclick: () => { m.remove(); prepareExact(exact, t); } }, 'MAKE THE PERFECT COIN')));
     } else submit();
   });
   const toggle = op => {
@@ -869,34 +1079,36 @@ function coinPicker() {
     render();
   };
   const rows = ok.map(c => h('div', { class: 'pick' + (C.chosen.includes(c.outpoint) ? ' sel' : ''), onclick: () => toggle(c.outpoint) },
-    h('div', { class: 'between' }, h('span', {}, sats(c.value) + ' sats' + (c.value === exact ? '  ★ EXACT' : '') + (c.mixed ? ' · mixed' : '')), C.chosen.includes(c.outpoint) ? h('span', { class: 'good' }, '✓') : null),
+    h('div', { class: 'between' }, h('span', {}, sats(c.value) + ' sats' + (c.value === exact && !pay ? '  ★ EXACT' : '') + (c.mixed ? ' · mixed' : '')), C.chosen.includes(c.outpoint) ? h('span', { class: 'good' }, '✓') : null),
     h('div', { class: 'faint small' }, c.address ? c.address.slice(0, 10) + '…' + c.address.slice(-8) : c.outpoint.slice(0, 10) + '…:' + c.outpoint.split(':')[1])));
   const shortRows = short.map(c => h('div', { class: 'pick' },
     h('div', { class: 'faint' }, sats(c.value) + ' sats'),
     h('div', { class: 'warnc small' }, `${sats(exact - c.value)} sats short of this pool's fee (${fmtRate(k.rate)} sat/vB): it fits a pool at a lower rate`)));
   const summary = C.chosen.length ? h('p', { class: (ch === null ? 'warnc' : 'good') + ' small' }, ch === null
-    ? `${C.chosen.length} coin(s), ${sats(total)} sats: ${sats(k.amount * o + feeShare(k.rate, false, C.chosen.length, cjType(), o) - total)} sats short`
-    : ch === 0 ? (total === exact ? '★ exact: no change' : `no change, ${sats(total - k.amount * o - feeShare(k.rate, false, C.chosen.length, cjType(), o))} extra to the miners`)
-      : `${C.chosen.length} coin(s) · ${sats(total)} sats → ${amountOf(k.amount, o)} mixed + ${sats(ch)} change · fee ${sats(total - k.amount * o - ch)}`) : null;
+    ? `${C.chosen.length} coin(s), ${sats(total)} sats: ${sats(mixTotal + feeShare(k.rate, false, C.chosen.length, t, fo) - total)} sats short`
+    : ch === 0 ? (total === exact ? `★ exact: no change · fee ${sats(total - mixTotal)} sats` : `${C.chosen.length} coin(s) · no change, ${sats(total - mixTotal)} sats to the miners`)
+      // Opening a payment pool: what goes in is paid to the recipients, not mixed.
+      : v5 ? `${C.chosen.length} coin(s) · ${sats(total)} sats → ${sats(mixTotal)} paid + ${sats(ch)} change · fee ${sats(total - mixTotal - ch)}`
+      : `${C.chosen.length} coin(s) · ${sats(total)} sats → ${amountOf(k.amount, o)} mixed + ${sats(ch)} change · fee ${sats(total - mixTotal - ch)}`) : null;
   const hasExact = coins.some(c => c.value === exact);
+  const pickLine = maxIn > 1 ? `Tick up to ${maxIn} confirmed ${kindName(t)} coins that together make at least ${sats(mixTotal)} sats plus your fee. The leftover comes back to a fresh change address`
+    : `Pick ONE confirmed ${kindName(t)} coin of at least ${sats(exact)} sats. Its leftover comes back to a fresh change address`;
   return h('div', { class: 'panel' }, h('div', { class: 'label' }, k.title),
     poolPw ? h('div', {}, h('p', { class: 'small soft' }, '🔒 Private pool: its creator shares the password with the people invited. Without it the pool refuses you.'), poolPw) : null,
-    h('p', { class: 'small soft' }, `Only ${kindName(cjType())} coins can join this pool. Your other coins can still pay for an exact coin of this type.`),
+    pay ? null : h('p', { class: 'small soft' }, `Only ${kindName(t)} coins can join this pool. Your other coins can still pay for an exact coin of this type.`),
     destPick,
-    C.dest ? h('p', { class: 'small soft' }, (maxIn > 1
-      ? `Tick up to ${maxIn} confirmed coins that together make at least ${sats(k.amount * o)} sats plus your fee. The leftover comes back to a fresh change address. `
-      : `Pick ONE confirmed coin of at least ${sats(exact)} sats. Its leftover comes back to a fresh change address. `) +
+    v5 ? h('p', { class: 'small soft' }, pickLine + '. Your outputs are the payments, one to each recipient.')
+    : pay ? h('p', { class: 'small soft' }, pickLine + '. The pool\'s outputs go to the payment\'s recipients, one each.')
+    : C.dest ? h('p', { class: 'small soft' }, pickLine + '. ' +
       (o > 1 ? `Each of your ${o} mixed outputs of ${sats(k.amount)} sats goes to its own unused address of the wallet chosen above.` : 'The mixed output goes to an unused address of the wallet chosen above.'))
-    : h('p', { class: 'small soft' }, maxIn > 1
-      ? `Tick up to ${maxIn} confirmed coins that together make at least ${sats(k.amount * o)} sats plus your fee. The leftover comes back to a fresh change address; ` +
-        (o > 1 ? `each of your ${o} mixed outputs of ${sats(k.amount)} sats goes to its own fresh address of this wallet.` : 'the mixed output goes to another fresh address of this wallet.')
-      : `Pick ONE confirmed coin of at least ${sats(exact)} sats. Its leftover comes back to a fresh change address; ` +
+    : h('p', { class: 'small soft' }, pickLine + '; ' +
         (o > 1 ? `each of your ${o} mixed outputs of ${sats(k.amount)} sats goes to its own fresh address of this wallet.` : 'the mixed output goes to another fresh address of this wallet.')),
+    k.leftOut > 0 ? h('p', { class: 'warnc small' }, `${k.leftOut} of the coins ticked in SEND can't go in (unconfirmed, of another address type, or already in a pool): tick others here.`) : null,
     ok.length ? rows : h('p', { class: 'warnc small' }, 'No confirmed coin is big enough.'),
     shortRows, summary,
-    hasExact ? null : h('button', { class: 'link', onclick: () => prepareExact(exact, cjType()) }, `＋ PREPARE AN EXACT COIN OF ${sats(exact)} SATS`),
+    hasExact || pay ? null : h('button', { class: 'link', onclick: () => prepareExact(exact, t) }, `＋ PREPARE AN EXACT COIN OF ${sats(exact)} SATS`),
     pw,
-    h('div', { class: 'btns' }, h('button', { class: 'soft', onclick: cancelPick }, 'CANCEL'), use));
+    h('div', { class: 'btns' }, h('button', { class: 'soft', onclick: cancelPick }, pay ? 'BACK' : 'CANCEL'), use));
 }
 
 /** A list of addresses with their paths (another wallet's, for a coinjoin), full and copyable. */
@@ -1050,6 +1262,9 @@ function roundNeedsMe(p) {
   return (p.phase === 'VOTING' && !p.iAsked && !p.voted) || (p.phase === 'SIGNING' && !p.signed);
 }
 
+/** A payment pool's creator pays its recipients: no "each" about it. */
+const roundTitle = p => p.v5 && p.creator ? `${sats(p.mixTotal)} sats to ${(p.payments || []).length} recipient(s)` : amountOf(p.amount, p.outputs) + ' sats each';
+
 /** One round at a glance: amount, the bar of its five steps, what is happening and where your coin is. */
 function roundCard(p) {
   const step = roundStep(p), ended = step === 0;
@@ -1063,10 +1278,13 @@ function roundCard(p) {
     SIGNING: p.signed ? 'Signed · waiting for the others' : roundNeedsMe(p) ? 'Ready to sign' : 'Signing',
     BROADCAST: 'Sent · waiting for a block', CONFIRMED: 'Confirmed', ABORTED: 'Cancelled', REJECTED: 'Refused',
   }[p.phase] || p.phase;
-  const where = p.phase === 'BROADCAST' ? 'Your coin left in the group transaction. Waiting for a block.'
-    : p.phase === 'CONFIRMED' ? (p.outputs > 1 ? `Done: your ${p.outputs} mixed coins of ${sats(p.amount)} sats are in your wallet.` : `Done: your mixed coin of ${sats(p.amount)} sats is in your wallet.`)
-    : ended ? `${(p.reason || 'ended').replace(/^./, c => c.toUpperCase())}. Your coin did not move.`
-    : 'Your coin is still in your wallet — it hasn\'t left.';
+  // A payment through the pool: its outputs are the recipients', never this wallet's.
+  const pay = p.pay;
+  const where = p.phase === 'BROADCAST' ? (pay ? 'The payment left in the group transaction. Waiting for a block.' : 'Your coin left in the group transaction. Waiting for a block.')
+    : p.phase === 'CONFIRMED' ? (pay ? `Done: paid ${sats(p.mixTotal)} sats to the recipients.`
+      : p.outputs > 1 ? `Done: your ${p.outputs} mixed coins of ${sats(p.amount)} sats are in your wallet.` : `Done: your mixed coin of ${sats(p.amount)} sats is in your wallet.`)
+    : ended ? `${(p.reason || 'ended').replace(/^./, c => c.toUpperCase())}. ` + (pay ? 'Nothing was paid: send it normally if you like.' : 'Your coin did not move.')
+    : pay ? 'Not paid yet: the payment goes out when the pool closes.' : 'Your coin is still in your wallet — it hasn\'t left.';
   const cls = ended ? 'badc' : step === 5 ? 'good' : 'accent';
   const dots = [];
   for (let i = 1; i <= 5; i++) {
@@ -1075,7 +1293,7 @@ function roundCard(p) {
   }
   return h('div', { class: 'panel round' + (ended ? ' bad' : '') },
     h('div', { class: 'tap', onclick: () => { C.open[p.id] = !open; render(); } },
-      h('div', { class: 'between' }, h('span', { class: 'mid' }, (p.private ? '🔒 ' : '') + amountOf(p.amount, p.outputs) + ' sats each' + (p.script === 'p2tr' ? ' · Taproot' : '')),
+      h('div', { class: 'between' }, h('span', { class: 'mid' }, (p.private ? '🔒 ' : '') + (pay ? '💸 ' : '') + roundTitle(p) + (p.script === 'p2tr' ? ' · Taproot' : '')),
         h('span', { class: cls + ' mid' }, (ended ? '' : step + '/5 ') + (open ? '⌄' : '›'))),
       ended ? null : h('div', { class: 'steps' }, dots),
       h('p', { class: cls }, status),

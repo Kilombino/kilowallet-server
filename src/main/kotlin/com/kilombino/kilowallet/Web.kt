@@ -252,7 +252,10 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
             "/api/send/prepare" -> {
                 val chosen = b.optJSONArray("coins")?.let { a -> (0 until a.length()).map { a.getString(it) }.toSet() } ?: emptySet()
                 val amount = b.optLong("amount", 0).takeIf { it > 0 && !b.optBoolean("max") }
-                review(ex, w, planSend(w, chosen, resolve(b.getString("to")), amount, b.getDouble("rate")))
+                // More recipients, as the app's SEND: one transaction pays them all.
+                val extra = b.optJSONArray("extra")?.let { a -> (0 until a.length()).map { a.getJSONObject(it) }
+                    .map { resolve(it.getString("to")) to it.optLong("amount", 0) } } ?: emptyList()
+                review(ex, w, planSend(w, chosen, resolve(b.getString("to")), amount, b.getDouble("rate"), extra))
             }
             "/api/bump" -> review(ex, w, Spend.bump(w, b.getString("txid"), b.getDouble("rate"), ours(), oursTypes()).also { requireUnlocked(it) })
             "/api/cpfp" -> review(ex, w, Spend.cpfp(w, b.getString("txid"), b.getDouble("rate"), allSpendable()))
@@ -529,7 +532,8 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
      * A send, with coins in a live round left out. Without coin control, unmixed coins are
      * tried first, so a mixed coin is never pulled in with others unless nothing else covers it.
      */
-    private fun planSend(w: NodeWallet, chosen: Set<String>, to: String, amount: Long?, rate: Double): Spend.Draft {
+    private fun planSend(w: NodeWallet, chosen: Set<String>, to: String, amount: Long?, rate: Double,
+                         extra: List<Pair<String, Long>> = emptyList()): Spend.Draft {
         val locked = coinjoin.lockedOutpoints()
         require(chosen.none { it in locked }) { "A chosen coin is in a coinjoin round right now." }
         val coins = allSpendable()
@@ -539,9 +543,9 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
         if (chosen.isEmpty() && amount != null) {
             val mixed = coinjoin.mixedScripts()
             val plain = coins.filter { !isMixed(w, it, mixed) }
-            if (plain.size in 1 until coins.size) runCatching { return Spend.plan(w, plain, chosen, to, amount, rate, changeTo) }
+            if (plain.size in 1 until coins.size) runCatching { return Spend.plan(w, plain, chosen, to, amount, rate, changeTo, extra) }
         }
-        return Spend.plan(w, coins, chosen, to, amount, rate, changeTo)
+        return Spend.plan(w, coins, chosen, to, amount, rate, changeTo, extra)
     }
 
     /** A warning when the send would undo a mix: a mixed coin spent with others ties them together again. */
@@ -625,27 +629,64 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
                 reply(ex, 200, JSONArray(list.map { termsJson(it) }))
             }
             "/api/coinjoin/create" -> {
-                val amount = b.optLong("amount", 0); val rate = b.optDouble("feeRate", 0.0)
+                val rate = b.optDouble("feeRate", 0.0)
                 val maxPeers = b.optInt("maxPeers", 5); val minPeers = b.optInt("minPeers", 2); val hours = b.optInt("hours", 6)
-                require(amount in Protocol.MIN_AMOUNT..Protocol.MAX_AMOUNT) { "Amount: ${Protocol.MIN_AMOUNT} to ${Protocol.MAX_AMOUNT} sats (1 BTC)." }
                 require(rate in 1.0..500.0) { "Fee: 1 to 500 sat/vB." }
                 require(maxPeers in Protocol.MIN_PEERS..Protocol.MAX_PEERS) { "Most people: ${Protocol.MIN_PEERS} to ${Protocol.MAX_PEERS}." }
                 require(minPeers in Protocol.MIN_PEERS..maxPeers) { "Fewest people: ${Protocol.MIN_PEERS} to $maxPeers (the most)." }
                 require(hours in 1..72) { "Open for 1 to 72 hours." }
                 val maxInputs = b.optInt("maxInputs", 1)
                 require(maxInputs in 1..Protocol.MAX_INPUTS) { "Coins per person: 1 to ${Protocol.MAX_INPUTS}." }
-                val outputs = b.optInt("outputs", 1)
-                require(outputs in 1..Protocol.MAX_OUTPUTS) { "Mixed outputs per person: 1 to ${Protocol.MAX_OUTPUTS}." }
-                val pw = cjWallet(if (b.optString("script") == "p2tr") ScriptType.P2TR else ScriptType.P2WPKH)
+                // A payment from SEND (as the app since 1.2.7): its recipients, each with its amount.
+                val pay = b.optJSONArray("pay")?.let { a -> (0 until a.length()).map { a.getJSONObject(it) }.map { it.getString("to").trim() to it.getLong("amount") } }
+                val payV5 = pay != null && b.optBoolean("paymentPool")
+                val check = pay?.let { CoinjoinPay.check(it, walletFor(ScriptType.P2TR) != null) }
+                if (check != null) require(if (payV5) check.paymentOk else check.ok) { check.reason ?: "These payments can't go through one pool." }
+                val type = check?.type ?: if (b.optString("script") == "p2tr") ScriptType.P2TR else ScriptType.P2WPKH
+                val pw = cjWallet(type)
                 val us = cjCoins(pw, b)
                 require(us.size <= maxInputs) { "At most $maxInputs coin(s) per person in this pool." }
-                require(CoinjoinTx.change(us.sumOf { it.value }, amount, rate, us.size, pw.type, outputs) != null) { "These coins are too small for this pool." }
+                // v5: the payments' total split for the others, the outputs asked for when it splits evenly, else one.
+                val split = if (payV5) Protocol.v5Split(check!!.amounts.sum(), b.optInt("outputs", 1)) else null
+                val outputs = split?.second ?: if (pay != null) pay.size else b.optInt("outputs", 1)
+                require(outputs in 1..Protocol.MAX_OUTPUTS) { "Mixed outputs per person: 1 to ${Protocol.MAX_OUTPUTS}." }
+                // From your coins (the app's default since 1.2.7): the amount worked out so they go in with no change.
+                val fromCoins = pay == null && b.optBoolean("fromCoins")
+                val amount = when {
+                    split != null -> split.first
+                    pay != null -> check!!.amount
+                    fromCoins -> CoinjoinTx.noChangeAmount(us.sumOf { it.value }, us.size, rate, pw.type, outputs) ?: error("These coins don't even cover the fee.")
+                    else -> b.optLong("amount", 0)
+                }
+                require(amount in Protocol.TEST_MIN_AMOUNT..Protocol.MAX_AMOUNT) {
+                    if (fromCoins) "These coins make ${amount.coerceAtLeast(0)} sats per output: a pool takes ${Protocol.TEST_MIN_AMOUNT} to ${Protocol.MAX_AMOUNT} sats (1 BTC) per output."
+                    else "Amount per output: ${Protocol.TEST_MIN_AMOUNT} to ${Protocol.MAX_AMOUNT} sats (1 BTC)."
+                }
+                // The minimum is per person in all, amount × outputs (the app since 1.2.7): below it a pool is only a test.
+                require(amount * outputs >= Protocol.MIN_AMOUNT) {
+                    "$amount × $outputs = ${amount * outputs} sats each: a pool takes at least ${Protocol.MIN_AMOUNT} each in all."
+                }
+                val payments = if (payV5) check!!.amounts else emptyList()
+                // What our seat puts in, over how many outputs of ours (the payments, for a payment pool's creator).
+                val mixTotal = amount * outputs
+                val ourOutputs = if (payV5) payments.size else outputs
+                require(CoinjoinTx.changeOf(us.sumOf { it.value }, mixTotal, rate, us.size, pw.type, ourOutputs) != null) { "These coins are too small for this pool." }
                 val s = recheck(b)
-                val dest = b.optString("dest").ifEmpty { null }
-                val mixes = dest?.let { coinjoin.destScripts!!(it, pw.type, outputs) }
-                val st = coinjoin.create(s, pw, us, amount, rate, minPeers, maxPeers, hours, b.optString("poolPassword"), maxInputs, outputs, mixes)
+                val dest = if (pay != null) null else b.optString("dest").ifEmpty { null }
+                val mixes = check?.scripts ?: dest?.let { coinjoin.destScripts!!(it, pw.type, outputs) }
+                val st = coinjoin.create(s, pw, us, amount, rate, minPeers, maxPeers, hours, b.optString("poolPassword"), maxInputs, outputs, mixes, payments)
+                if (pay != null) coinjoin.rememberDest(st.poolId, Coinjoin.PAY)
                 dest?.let { coinjoin.rememberDest(st.poolId, it, destinations.get(it).which()) }
-                reply(ex, 200, JSONObject().put("pool", st.poolId))
+                reply(ex, 200, JSONObject().put("pool", st.poolId).put("amount", amount).put("outputs", outputs))
+            }
+            // Whether SEND's recipients can be paid through a pool, and how (the app's rule).
+            "/api/coinjoin/pay/check" -> {
+                val a = b.getJSONArray("recipients")
+                val r = (0 until a.length()).map { a.getJSONObject(it) }.map { it.optString("to").trim() to it.optLong("amount", 0) }
+                val c = CoinjoinPay.check(r, walletFor(ScriptType.P2TR) != null)
+                reply(ex, 200, JSONObject().put("ok", c.ok).put("paymentOk", c.paymentOk).put("any", c.any).put("reason", c.reason ?: JSONObject.NULL)
+                    .put("type", c.type?.let { Protocol.scriptName(it) } ?: JSONObject.NULL).put("amount", c.amount)
+                    .put("amounts", JSONArray(c.amounts)).put("total", c.amounts.sum()))
             }
             "/api/coinjoin/join" -> {
                 val id = b.getString("pool")
@@ -695,7 +736,8 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
                 if (after != null && b.optLong("exact", 0) > 0) {
                     val c = after.optJSONObject("create")
                     if (c != null) {
-                        require(c.optLong("amount") in Protocol.MIN_AMOUNT..Protocol.MAX_AMOUNT && c.optDouble("feeRate") in 1.0..500.0 &&
+                        require(c.optLong("amount") in Protocol.TEST_MIN_AMOUNT..Protocol.MAX_AMOUNT &&
+                            c.optLong("amount") * c.optInt("outputs", 1) >= Protocol.MIN_AMOUNT && c.optDouble("feeRate") in 1.0..500.0 &&
                             c.optInt("maxPeers") in Protocol.MIN_PEERS..Protocol.MAX_PEERS && c.optInt("minPeers") in Protocol.MIN_PEERS..c.optInt("maxPeers") &&
                             c.optInt("hours") in 1..72 && c.optInt("maxInputs", 1) in 1..Protocol.MAX_INPUTS &&
                             c.optInt("outputs", 1) in 1..Protocol.MAX_OUTPUTS) { "Check the pool's settings." }
@@ -725,6 +767,7 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
         .put("feeWithChange", CoinjoinTx.feeShare(t.feeRate, true, 1, t.script, t.outputs))
         .put("feeNoChange", CoinjoinTx.feeShare(t.feeRate, false, 1, t.script, t.outputs))
         .put("script", Protocol.scriptName(t.script)).put("maxInputs", t.maxInputs).put("version", t.version).put("outputs", t.outputs)
+        .put("v5", t.v5).put("payments", JSONArray(t.payments)).put("mixTotal", t.mixTotal).put("test", Protocol.isTest(t))
         .put("joinable", walletFor(t.script) != null)
 
     private fun coinjoinJson(w: NodeWallet): JSONObject {
@@ -737,6 +780,8 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
             .put("unlockedForAutoSign", secret != null)
             .put("waitingExact", JSONArray(coinjoin.waitingExact().map { JSONObject().put("value", it.value).put("create", it.create != null) }))
             .put("limits", JSONObject().put("minAmount", Protocol.MIN_AMOUNT).put("maxAmount", Protocol.MAX_AMOUNT)
+                .put("testMinAmount", Protocol.TEST_MIN_AMOUNT).put("minPayment", Protocol.MIN_PAYMENT).put("maxOutputs", Protocol.MAX_OUTPUTS)
+                .put("maxInputs", Protocol.MAX_INPUTS)
                 .put("minPeers", Protocol.MIN_PEERS).put("maxPeers", Protocol.MAX_PEERS).put("voteMinutes", Protocol.VOTE_SECONDS / 60)
                 .put("joinMinutes", PoolSession.JOIN_TIMEOUT / 60).put("dust", CoinjoinTx.DUST))
         o.put("mine", JSONArray(coinjoin.states().map { stateJson(it) }))
@@ -762,13 +807,19 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
             .put("expiresAt", st.terms.expiresAt).put("phaseDeadline", st.phaseDeadline).put("voteDeadline", st.voteDeadline)
             .put("coinValue", st.seat.inputValue).put("coins", st.seat.coins.size).put("change", st.seat.changeValue)
             .put("script", Protocol.scriptName(st.terms.script))
-            .put("dest", coinjoin.destOf(st.poolId)?.let { id ->
+            .put("dest", coinjoin.destOf(st.poolId)?.takeIf { it != Coinjoin.PAY }?.let { id ->
                 coinjoin.destWhichOf(st.poolId) ?: destinations.list().firstOrNull { it.id == id }?.which() ?: "another wallet (removed since)" } ?: JSONObject.NULL)
+            .put("v5", st.terms.v5).put("payments", JSONArray(st.terms.payments)).put("mixTotal", st.terms.mixTotal)
+            // A payment through the pool: what it pays, and to whom (only on this server, never announced).
+            .put("pay", coinjoin.isPay(st.poolId))
+            .put("recipients", if (!coinjoin.isPay(st.poolId)) JSONArray() else JSONArray(st.mixScripts.mapIndexed { i, sp ->
+                JSONObject().put("address", Spend.addressOf(sp)).put("amount", if (st.terms.v5 && st.creator) st.terms.payments.getOrElse(i) { 0L } else st.terms.amount) }))
             .put("iAsked", st.voteBy != null && st.voteBy == st.token?.let { Protocol.tokenHash(it) })
             .put("voted", st.votedOn != null && st.votedOn == st.voteId)
             .put("signed", st.postedSig).put("sigs", st.sigs.size).put("txid", st.txid ?: "")
             .put("planFee", plan?.fee ?: 0).put("planPeople", st.round.size).put("planCoins", plan?.coins?.size ?: 0)
             .put("planIdentical", plan?.outputs?.count { it.value == st.terms.amount } ?: 0)
+            .put("planPayments", if (st.terms.v5) st.terms.payments.size else 0)
     }
 
     /** A user@domain handle isn't resolved on the server yet: only addresses. */
@@ -804,6 +855,7 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
             .put("change", d.change).put("inputs", d.inputs.size).put("vbytes", d.vbytes)
             .put("changeAddress", d.changeIndex?.let { Spend.addressOf((walletFor(d.changeType) ?: w).script(1, it)) } ?: JSONObject.NULL)
             .put("cancels", d.cancels)
+            .put("recipients", JSONArray(d.recipients.map { (a, v) -> JSONObject().put("to", a).put("amount", v) }))
             .put("rate", d.fee / d.vbytes).put("concern", Spend.concern(d) ?: JSONObject.NULL)
             .put("replaces", d.replaces ?: JSONObject.NULL).put("replacedFee", d.replacedFee)
             .put("cpfpParent", d.cpfpParent ?: JSONObject.NULL).put("packageRate", d.packageRate)
@@ -930,7 +982,7 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
     })
 
     companion object {
-        const val VERSION = "0.8.0"
+        const val VERSION = "0.9.0"
         /** How far (per branch) a replaced transaction's coins are looked up in this wallet. */
         const val OURS = 400
     }

@@ -37,7 +37,7 @@ class Coinjoin(private val dir: File, private val rpc: Rpc, private val walletPr
     /** The unlocked wallet's words, for signing on its own (null while locked). */
     @Volatile var secretProvider: () -> Vault.Secret? = { null }
 
-    private fun sats(v: Long) = "%,d".format(v).replace(',', ' ')
+    private fun sats(v: Long) = "%,d".format(java.util.Locale.ROOT, v).replace(',', ' ')
 
     // ------------------------------------------------------------------ settings
 
@@ -85,6 +85,8 @@ class Coinjoin(private val dir: File, private val rpc: Rpc, private val walletPr
         val saved = (0 until a.length()).map { a.getString(it) }
         val live = sessions.values.map { it.state }
             .filter { it.phase == PoolSession.Phase.BROADCAST || it.phase == PoolSession.Phase.CONFIRMED }
+            // A payment's outputs are the recipients' coins, not ours.
+            .filter { !isPay(it.poolId) }
             .flatMap { st -> st.mixScripts.map { it.toHex() } }
         return (saved + live).toSet()
     }
@@ -195,12 +197,20 @@ class Coinjoin(private val dir: File, private val rpc: Rpc, private val walletPr
         return Pick(coins, nodes.map { it.key }, paths, mixes, change)
     }
 
+    /**
+     * [payments]: a payment pool (Kilojoin v5, as the app since 1.2.7): the amounts [mixes] (the
+     * recipients' scripts, one each) are paid, summing to [outputs] × [amount], what each of the
+     * others gets back in equal outputs. Empty for a pool of equal outputs.
+     */
     fun create(secret: Vault.Secret, w: NodeWallet, us: List<NodeWallet.Utxo>, amount: Long, feeRate: Double, minPeers: Int, maxPeers: Int,
-               hours: Int, password: String?, maxInputs: Int = 1, outputs: Int = 1, mixes: List<ByteArray>? = null): PoolSession.State {
-        // Kilojoin v3 (blind outputs), like the app since 1.1.5; v4 with several outputs each (1.2.0).
+               hours: Int, password: String?, maxInputs: Int = 1, outputs: Int = 1, mixes: List<ByteArray>? = null,
+               payments: List<Long> = emptyList()): PoolSession.State {
+        // Kilojoin v3 (blind outputs), like the app since 1.1.5; v4 with several outputs each (1.2.0); v5 payments (1.2.7).
         val np = PoolSession.newPool(amount, feeRate, maxPeers, hours, minPeers, !password.isNullOrEmpty(), w.type, maxInputs, v3 = true,
-            outputs = outputs)
-        return createWith(pick(secret, w, us, outputs, mixes), np, password)
+            outputs = outputs, payments = payments)
+        // The creator of a payment pool has one output per payment, whatever the others get.
+        require(payments.isEmpty() || mixes?.size == payments.size) { "One recipient per payment." }
+        return createWith(pick(secret, w, us, if (payments.isEmpty()) outputs else payments.size, mixes), np, password)
     }
 
     private fun createWith(p: Pick, np: PoolSession.Companion.NewPool, password: String?): PoolSession.State =
@@ -249,16 +259,22 @@ class Coinjoin(private val dir: File, private val rpc: Rpc, private val walletPr
     /** Mixed-output scripts seats still count on: rounds not over, or over after we posted ours. */
     fun heldScripts(): Set<String> = sessions.values.map { it.state }.filter { st ->
         val ended = st.phase == PoolSession.Phase.ABORTED || st.phase == PoolSession.Phase.REJECTED
-        !(ended && !st.postedOutput)
+        !(ended && !st.postedOutput) && !isPay(st.poolId)
     }.flatMap { it.mixScripts.map { m -> m.toHex() } }.toSet()
 
     private val destFile = File(dir, "coinjoin-dest.json")
+    companion object {
+        /** The "destination" of a payment through a pool: the recipients' own addresses, typed in SEND. */
+        const val PAY = "pay"
+    }
     /** Which destination a pool's mixed outputs go to (only when not this wallet), for its card. */
     /** [which]: that wallet's name and key start when the round began, for the card (see [Destinations.Dest.which]). */
     @Synchronized fun rememberDest(poolId: String, destId: String, which: String? = null) {
         val o = if (destFile.exists()) runCatching { JSONObject(destFile.readText()) }.getOrDefault(JSONObject()) else JSONObject()
         o.put(poolId, destId + (which?.let { "|$it" } ?: "")); destFile.writeText(o.toString())
     }
+    /** A payment through the pool (from SEND): its outputs for us went to the recipients' own addresses. */
+    fun isPay(poolId: String): Boolean = destOf(poolId) == PAY
     @Synchronized private fun destNote(poolId: String): String? =
         if (destFile.exists()) runCatching { JSONObject(destFile.readText()).optString(poolId).ifEmpty { null } }.getOrNull() else null
     fun destOf(poolId: String): String? = destNote(poolId)?.substringBefore('|')
@@ -339,7 +355,8 @@ class Coinjoin(private val dir: File, private val rpc: Rpc, private val walletPr
         val now = System.currentTimeMillis() / 1000
         // A pool not re-announced for a while has lost its creator: nobody would let us in.
         return found.values.filter {
-            it.state == "open" && it.expiresAt > now && it.peers < it.maxPeers && it.amount >= Protocol.MIN_AMOUNT &&
+            // Below the minimum per person in all (amount × outputs) a pool is only a test, as in the app.
+            it.state == "open" && it.expiresAt > now && it.peers < it.maxPeers && !Protocol.isTest(it) &&
                 now - it.createdAt < Protocol.STALE_AFTER
         }.sortedByDescending { it.createdAt }
     }
@@ -353,7 +370,8 @@ class Coinjoin(private val dir: File, private val rpc: Rpc, private val walletPr
                 val pools = fetchPools(86400).filter { it.createdAt > last && it.id !in sessions.keys && !it.private }
                 pools.maxOfOrNull { it.createdAt }?.let { setSetting("last_pool_seen", it) }
                 pools.asSequence().filter { firstNotice(it.id) }.take(3).forEach { t -> emit("New coinjoin pool",
-                    "${sats(t.amount)} sats${if (t.script == ScriptType.P2TR) " · Taproot" else ""} · ${t.peers}/${t.maxPeers} people · ${t.feeRate} sat/vB", t.id) }
+                    "${if (t.outputs > 1) "${t.outputs} × " else ""}${sats(t.amount)} sats${if (t.script == ScriptType.P2TR) " · Taproot" else ""}" +
+                        (if (t.v5) " · a payment pool" else "") + " · ${t.peers}/${t.maxPeers} people · ${t.feeRate} sat/vB", t.id) }
             }
         }, 20, 300, TimeUnit.SECONDS)
         Executors.newSingleThreadScheduledExecutor().scheduleWithFixedDelay({ runCatching { checkExact() } }, 30, 30, TimeUnit.SECONDS)
@@ -407,7 +425,9 @@ class Coinjoin(private val dir: File, private val rpc: Rpc, private val walletPr
             persist()
         }
         override fun event(e: PoolSession.Event) {
-            val pool = (if (st.terms.outputs > 1) "${st.terms.outputs} × " else "") + "${sats(st.terms.amount)} sats pool"
+            val pay = isPay(st.poolId)
+            val pool = if (st.terms.v5 && st.creator) "payment pool, ${sats(st.terms.mixTotal)} sats to ${st.terms.payments.size} recipient(s)"
+                else (if (st.terms.outputs > 1) "${st.terms.outputs} × " else "") + "${sats(st.terms.amount)} sats pool" + (if (pay) " (a payment)" else "")
             when (e) {
                 is PoolSession.Event.Changed -> {}
                 is PoolSession.Event.DidAlone -> {}   // the app's way of running on its own; here the events below do it
@@ -435,9 +455,12 @@ class Coinjoin(private val dir: File, private val rpc: Rpc, private val walletPr
                     else emit("Coinjoin: sign now", "$pool · the transaction is ready to sign" +
                         (if (autoSign) " (the service restarted: unlock Kilowallet to sign)" else ""), st.poolId)
                 }
-                is PoolSession.Event.Broadcast -> { roundKeys.remove(st.poolId); rememberMixed(st.mixScripts.map { it.toHex() }); rescanSoon(e.txid); emit("Coinjoin sent", "$pool · ${e.txid}", st.poolId) }
-                is PoolSession.Event.Confirmed -> { rememberMixed(st.mixScripts.map { it.toHex() }); rescanSoon(e.txid); emit("Coinjoin confirmed", "$pool · ${e.txid}", st.poolId) }
-                is PoolSession.Event.Aborted -> { roundKeys.remove(st.poolId); emit("Coinjoin cancelled", "$pool · ${e.reason}. Your coin did not move.", st.poolId) }
+                is PoolSession.Event.Broadcast -> { roundKeys.remove(st.poolId); if (!pay) rememberMixed(st.mixScripts.map { it.toHex() }); rescanSoon(e.txid)
+                    emit(if (pay) "Coinjoin sent: the payment left" else "Coinjoin sent", "$pool · ${e.txid}", st.poolId) }
+                is PoolSession.Event.Confirmed -> { if (!pay) rememberMixed(st.mixScripts.map { it.toHex() }); rescanSoon(e.txid)
+                    emit(if (pay) "Coinjoin confirmed: paid" else "Coinjoin confirmed", "$pool · ${e.txid}", st.poolId) }
+                is PoolSession.Event.Aborted -> { roundKeys.remove(st.poolId)
+                    emit("Coinjoin cancelled", "$pool · ${e.reason}. " + (if (pay) "Nothing was paid: send it normally if you like." else "Your coin did not move."), st.poolId) }
                 is PoolSession.Event.ExpiringSoon -> emit("Coinjoin: under an hour left",
                     "$pool · ${e.peers}/${st.terms.maxPeers} people, enough to mix. It expires in ${e.minutes} min: ask to close now.", st.poolId)
             }
