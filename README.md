@@ -1,6 +1,6 @@
 # Kilowallet server
 
-Kilowallet, the Bitcoin BLAKE2b (XBT) wallet, for a home node: the same wallet code as the
+Kilowallet, the Bitcoin BLAKE2b (BTC) wallet, for a home node: the same wallet code as the
 [Android app](https://github.com/Kilombino/kilowallet) (a submodule), with a web app made for the
 phone, that reads the chain straight from your own node — no Electrum server.
 
@@ -23,7 +23,7 @@ phone, that reads the chain straight from your own node — no Electrum server.
 - **Ark** (beta, opt-in): the app's ARK tab, through the Paperclip Ark server
   (ark.paperclippool.xyz), with the same words as the wallet. Receive to an Ark address, a
   Lightning invoice or a reusable BOLT12 offer, or on-chain to a deposit that you MOVE INTO ARK;
-  send to Ark, Lightning or an XBT address with the exact cost shown first; renew, coin control,
+  send to Ark, Lightning or a Bitcoin (BLAKE2b) address with the exact cost shown first; renew, coin control,
   emergency exit; alerts (StartOS notifications and Telegram) for payments, renewals and coins
   close to expiry. Hot wallets only.
 
