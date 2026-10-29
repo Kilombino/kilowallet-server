@@ -43,7 +43,9 @@ class ArkEngine(
         const val BOARD_CONFIRMATIONS = 3
         const val MAX_VTXO_SAT = 1_000_000L
         const val MAX_LIGHTNING_SAT = 250_000L
-        const val RESERVE_SAT = 2_000L
+        // Reserve per recovery transaction of an ordinary transfer (Paperclip 0.9.x economical
+        // transfers: 330-sat anchor + 198-sat miner fee), as the app's engine.
+        const val RESERVE_SAT = 528L
         const val MIN_OUTPUT_SAT = 1_330L
         /** Paperclip Ark opened in late September 2026: a restored wallet's deposit can't be older. */
         const val ARK_EPOCH_HEIGHT = 973_000

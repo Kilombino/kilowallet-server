@@ -982,7 +982,7 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
     })
 
     companion object {
-        const val VERSION = "0.9.1"
+        const val VERSION = "0.9.2"
         /** How far (per branch) a replaced transaction's coins are looked up in this wallet. */
         const val OURS = 400
     }

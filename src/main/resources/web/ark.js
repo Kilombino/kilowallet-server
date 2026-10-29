@@ -71,7 +71,7 @@ function arkWarnings() {
       `Minimum to move funds into Ark: ${sats(l.minBoard)} sats.`,
       `Maximum per Ark coin: ${sats(l.maxVtxo)} sats.`,
       `Lightning: up to ${sats(l.maxLightning)} sats per payment, no channels needed.`,
-      'Every Ark payment pre-pays recovery reserves for each coin it uses: about 2 700 sats for a coin spent whole and 4 000 for one with change (4 000 and 6 000 where the server has not enabled its smaller anchors); change must be at least 1 330 sats. Small balances can only leave Ark on-chain. The wallet shows the exact cost before you confirm.',
+      'Every Ark payment pre-pays recovery reserves for each coin it uses: about 1 056 sats for a coin spent whole and 1 584 for one with change (4 000 and 6 000 where the server has not enabled its smaller anchors); change must be at least 1 330 sats. Small balances can only leave Ark on-chain. The wallet shows the exact cost before you confirm.',
       `Rounds every 60 seconds; moving funds in needs ${l.boardConfs} confirmations.`,
       'Back up Ark twice: your words (the same as this wallet\'s) let the Ark server hand your coins back; a StartOS backup of Kilowallet holds the Ark folder, which is what lets you leave Ark on your own if the server ever disappears. Make one after each movement.',
       'Ark is beta software, through the Paperclip Ark server (ark.paperclippool.xyz).'].map(t => h('p', { class: 'small soft' }, '•  ' + t)));
