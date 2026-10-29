@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "com.kilombino.kilowallet"
-version = "0.9.2"
+version = "0.10.0-beta1"
 
 kotlin {
     jvmToolchain(17)
@@ -42,6 +42,9 @@ dependencies {
 }
 
 tasks.test { useJUnitPlatform() }
+
+// The web page speaks the app's languages: its translation tables, straight from the Kilowallet submodule.
+tasks.processResources { from("kilowallet/app/src/main/assets/i18n") { into("web/i18n") } }
 
 // One self-contained jar for the container.
 tasks.register<Jar>("fatJar") {

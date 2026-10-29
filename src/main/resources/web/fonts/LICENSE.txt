@@ -1,0 +1,9 @@
+Droid Sans Mono (droidsansmono.woff2) and Roboto (roboto.woff2): Copyright Google Inc.,
+licensed under the Apache License, Version 2.0 (https://www.apache.org/licenses/LICENSE-2.0).
+Taken from Android's system fonts, subset and converted to WOFF2; the glyphs are unchanged.
+
+Noto Color Emoji (emoji*.woff2), the emoji Android shows: Copyright Google LLC, licensed under the
+SIL Open Font License 1.1 (https://openfontlicense.org). Subset to the few emoji this page uses.
+
+Noto Sans Symbols and Noto Sans Symbols 2 (symbols*.woff2), Android's fallback for these signs:
+Copyright Google LLC, SIL Open Font License 1.1. Subset to the signs this page uses.

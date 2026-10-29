@@ -4,6 +4,14 @@ Kilowallet, the Bitcoin BLAKE2b (BTC) wallet, for a home node: the same wallet c
 [Android app](https://github.com/Kilombino/kilowallet) (a submodule), with a web app made for the
 phone, that reads the chain straight from your own node — no Electrum server.
 
+- **The app's screens.** The web page is the Android app's advanced mode, screen by screen: the
+  wallet at the top, the BTC · COINJOIN · ARK tabs, the same cards, buttons, dialogs and settings,
+  its colours and fonts (Droid Sans Mono and Roboto, the phone's), and its languages (the app's own
+  translation tables: Spanish, English, Chinese, French, Italian, German, Catalan, Portuguese).
+  A new wallet's words come from real dice rolls (50 for 12 words, 99 for 24, by SHA-256 as on a
+  SeedSigner), are written down and optionally checked back before the wallet exists. Where the app
+  asks for the fingerprint, the page asks for the wallet's password.
+
 - **One person, one node.** The node gets a *watch-only* descriptor wallet (the account key only,
   no private keys), which tracks history, the mempool and balances, pruned node included.
 - **The keys never enter the node.** A hot wallet's words are encrypted on disk with your password

@@ -193,12 +193,15 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
     }
 
     private val types = mapOf("html" to "text/html; charset=utf-8", "js" to "application/javascript; charset=utf-8",
-        "css" to "text/css; charset=utf-8", "png" to "image/png", "json" to "application/manifest+json", "svg" to "image/svg+xml")
+        "css" to "text/css; charset=utf-8", "png" to "image/png", "json" to "application/manifest+json", "svg" to "image/svg+xml",
+        "woff2" to "font/woff2")
 
     private fun static(ex: HttpExchange, name: String) {
-        if (!name.matches(Regex("[a-z0-9.-]+"))) return reply(ex, 404, err("not found"))
+        // The page, its fonts and the app's language tables (i18n/<lang>.json, from the Kilowallet submodule).
+        if (!name.matches(Regex("(fonts/|i18n/)?[a-z0-9-]+(\\.[a-z0-9]+)+"))) return reply(ex, 404, err("not found"))
         val r = javaClass.getResourceAsStream("/web/$name")?.readBytes() ?: return reply(ex, 404, err("not found"))
-        reply(ex, 200, r, types[name.substringAfterLast('.')] ?: "application/octet-stream")
+        val type = if (name.startsWith("i18n/")) "application/json; charset=utf-8" else types[name.substringAfterLast('.')] ?: "application/octet-stream"
+        reply(ex, 200, r, type)
     }
 
     private fun newSession(ex: HttpExchange) {
@@ -227,6 +230,8 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
             val since = ex.requestURI.query?.substringAfter("since=")?.substringBefore('&')?.toLongOrNull() ?: 0L
             return reply(ex, 200, JSONArray(coinjoin.events.filter { it.at > since }.map { eventJson(it) }))
         }
+        // The BIP-39 word list, for the restore boxes' suggestions and the words check (as the app's).
+        if (p == "/bip39.json") return reply(ex, 200, JSONArray(com.kilombino.pyblockwatch.crypto.Bip39Wordlist.WORDS), "application/json")
         if (!p.startsWith("/api/")) return static(ex, if (p == "/") "index.html" else p.removePrefix("/"))
         if (p == "/api/state") return reply(ex, 200, JSONObject().put("mode", mode()).put("unlocked", authed(ex))
             .put("version", javaClass.`package`?.implementationVersion ?: VERSION).put("chain", chain.json()))
@@ -235,6 +240,8 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
         val b = if (ex.requestMethod == "POST") body(ex) else JSONObject()
         when (p) {
             "/api/setup/new" -> return setupNew(ex, b)
+            "/api/setup/dice" -> return setupDice(ex, b)
+            "/api/setup/fingerprint" -> return setupFingerprint(ex, b)
             "/api/setup/restore" -> return setupRestore(ex, b)
             "/api/setup/watch" -> return setupWatch(ex, b)
             "/api/unlock" -> return unlock(ex, b)
@@ -820,6 +827,8 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
             .put("planFee", plan?.fee ?: 0).put("planPeople", st.round.size).put("planCoins", plan?.coins?.size ?: 0)
             .put("planIdentical", plan?.outputs?.count { it.value == st.terms.amount } ?: 0)
             .put("planPayments", if (st.terms.v5) st.terms.payments.size else 0)
+            // When it went out and ended, for HISTORY (as the app since 1.4.0).
+            .put("sentAt", st.sentAt).put("endedAt", st.endedAt).put("created", st.created)
     }
 
     /** A user@domain handle isn't resolved on the server yet: only addresses. */
@@ -868,9 +877,32 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
 
     private fun setupNew(ex: HttpExchange, b: JSONObject) {
         requireNoWallet()
-        val words = Bip39.fromEntropy(ByteArray(if (b.optInt("count", 12) == 24) 32 else 16).also { rnd.nextBytes(it) })
+        // The words made from dice rolls (setup/dice), shown and written down before this; else random ones.
+        val given = b.optString("words").trim().lowercase().split(Regex("\\s+")).filter { it.isNotEmpty() }
+        val words = if (given.isNotEmpty()) given.also { require(Bip39.isValid(it)) { "These words are not a valid BIP-39 seed (a word is wrong or out of order)." } }
+            else Bip39.fromEntropy(ByteArray(if (b.optInt("count", 12) == 24) 32 else 16).also { rnd.nextBytes(it) })
         finishHot(ex, words, b.optString("passphrase"), b.getString("password"), null, restored = false)
         // The new words are shown once, to be written down.
+    }
+
+    /**
+     * Words from dice rolls, as the app's DiceScreen: 50 rolls for 12 words, 99 for 24, by SHA-256
+     * (the same rolls give the same words on a SeedSigner). Nothing is stored: setup/new takes the
+     * words once they are written down. [problems]: why the rolls don't look like real dice.
+     */
+    private fun setupDice(ex: HttpExchange, b: JSONObject) {
+        requireNoWallet()
+        val rolls = b.getString("rolls")
+        reply(ex, 200, JSONObject().put("words", diceWords(rolls, b.optInt("count", 12)).joinToString(" "))
+            .put("problems", JSONArray(com.kilombino.pyblockwatch.crypto.DiceCheck.problems(rolls))))
+    }
+
+    /** The master fingerprint of words + passphrase, to write down with them (the app's PassphraseFields). */
+    private fun setupFingerprint(ex: HttpExchange, b: JSONObject) {
+        requireNoWallet()
+        val words = b.getString("words").trim().lowercase().split(Regex("\\s+"))
+        require(Bip39.isValid(words)) { "These words are not a valid BIP-39 seed (a word is wrong or out of order)." }
+        reply(ex, 200, JSONObject().put("fingerprint", fingerprintOf(words, b.optString("passphrase"))))
     }
 
     private fun setupRestore(ex: HttpExchange, b: JSONObject) {
@@ -963,6 +995,8 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
                 JSONObject().put("outpoint", u.outpoint).put("value", u.value).put("confirmations", u.confirmations)
                     .put("address", walletOf(u).address(u.branch, u.index)).put("change", u.branch == 1)
                     .put("type", if (u.type == ScriptType.P2TR) "p2tr" else "p2wpkh")
+                    // Its derivation path, as the app lists addresses ("m/84'/0'/0'/0/3").
+                    .put("path", "m/${purposeOf(walletOf(u).type)}'/0'/0'/${u.branch}/${u.index}")
                     .put("mixed", isMixed(w, u, mixed)).put("inRound", u.outpoint in locked)
             }))
             .put("receive", JSONObject().put("index", ri).put("address", ra).put("path", "${ri}"))
@@ -977,13 +1011,26 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
         return o
     }
 
+    private fun purposeOf(t: ScriptType) = when (t) { ScriptType.P2PKH -> 44; ScriptType.P2SH_P2WPKH -> 49; ScriptType.P2WPKH -> 84; ScriptType.P2TR -> 86 }
+
     private fun destinationsJson(): JSONArray = JSONArray(destinations.list().map { d ->
         d.public().put("scanning", destinations.scanning(d))
     })
 
     companion object {
-        const val VERSION = "0.9.2"
+        const val VERSION = "0.10.0-beta1"
         /** How far (per branch) a replaced transaction's coins are looked up in this wallet. */
         const val OURS = 400
+
+        /** 12 words from exactly 50 rolls (1–6), 24 from 99: SHA-256 of the rolls, as SeedSigner and the app. */
+        fun diceWords(rolls: String, count: Int): List<String> {
+            val needed = if (count == 24) 99 else 50
+            require(rolls.length == needed && rolls.all { it in '1'..'6' }) { "$needed rolls of 1 to 6 are needed for $count words." }
+            return Bip39.fromEntropy(Bip39.entropyFromDiceRolls(rolls, if (count == 24) 256 else 128))
+        }
+
+        /** The master key's fingerprint of [words] with [passphrase], in hex (what Sparrow and SeedSigner show). */
+        fun fingerprintOf(words: List<String>, passphrase: String): String =
+            com.kilombino.pyblockwatch.crypto.Bip32Priv.fromSeed(Bip39.toSeed(words, passphrase)).fingerprint().toHex()
     }
 }
