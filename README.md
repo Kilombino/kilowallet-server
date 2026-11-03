@@ -23,7 +23,9 @@ phone, that reads the chain straight from your own node — no Electrum server.
 - **Coinjoin** (beta, opt-in): the app's COINJOIN tab, in the same pools as the app and
   [Kilojoin](https://github.com/Kilombino/kilojoin) (relay.kilombino.com, the app's own protocol
   code). Open a pool from whole coins with no change (or of an amount you type) or join one, pay up to five
-  recipients from SEND through a new pool (a payment pool, Kilojoin v5, when the amounts differ), ask to close, accept or refuse, sign after the server
+  recipients from SEND through a new pool (a payment pool, Kilojoin v5, when the amounts differ), open a pool with
+  asynchronous rounds (Kilojoin v6, as the app since 1.5.0: longer windows, every answer acknowledged by the creator,
+  rounds written to disk before anything is acknowledged), ask to close, accept or refuse, sign after the server
   checks your output, change and fee; coins in a live round are left out of sends, and mixed coins
   are flagged so they are not spent together with others. Alerts through your own Telegram bot,
   a sound in the browser, StartOS notifications, and an optional sign-on-its-own. Native SegWit
@@ -54,7 +56,8 @@ still 80, so it reads the raw header of the node's best block (or, while it sync
 header). A node on the SHA-256 chain, a node stopped on the last block before the fork (a Knots
 version without BLAKE2b) or one still syncing below it gets a page that says so and nothing else:
 no watch-only wallet is created or loaded, nothing is scanned or sent. Tests on regtest or testnet
-(`KILOWALLET_NETWORK` other than `blake2b`) skip it.
+(`KILOWALLET_NETWORK` other than `blake2b`) skip it, and may set `KILOWALLET_RELAY` (for example
+`ws://127.0.0.1:7777`) so their pools stay on a relay of their own.
 
 ### Ark
 

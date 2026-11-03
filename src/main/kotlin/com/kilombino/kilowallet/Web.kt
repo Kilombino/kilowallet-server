@@ -681,7 +681,8 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
                 val s = recheck(b)
                 val dest = if (pay != null) null else b.optString("dest").ifEmpty { null }
                 val mixes = check?.scripts ?: dest?.let { coinjoin.destScripts!!(it, pw.type, outputs) }
-                val st = coinjoin.create(s, pw, us, amount, rate, minPeers, maxPeers, hours, b.optString("poolPassword"), maxInputs, outputs, mixes, payments)
+                val st = coinjoin.create(s, pw, us, amount, rate, minPeers, maxPeers, hours, b.optString("poolPassword"), maxInputs, outputs, mixes, payments,
+                    async = b.optBoolean("async"))
                 if (pay != null) coinjoin.rememberDest(st.poolId, Coinjoin.PAY)
                 dest?.let { coinjoin.rememberDest(st.poolId, it, destinations.get(it).which()) }
                 reply(ex, 200, JSONObject().put("pool", st.poolId).put("amount", amount).put("outputs", outputs))
@@ -775,6 +776,8 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
         .put("feeNoChange", CoinjoinTx.feeShare(t.feeRate, false, 1, t.script, t.outputs))
         .put("script", Protocol.scriptName(t.script)).put("maxInputs", t.maxInputs).put("version", t.version).put("outputs", t.outputs)
         .put("v5", t.v5).put("payments", JSONArray(t.payments)).put("mixTotal", t.mixTotal).put("test", Protocol.isTest(t))
+        // Kilojoin v6: an asynchronous pool, and its windows (seconds).
+        .put("v6", t.v6).also { o -> t.async?.let { o.put("async", it.toJson()) } }
         .put("joinable", walletFor(t.script) != null)
 
     private fun coinjoinJson(w: NodeWallet): JSONObject {
@@ -817,6 +820,12 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
             .put("dest", coinjoin.destOf(st.poolId)?.takeIf { it != Coinjoin.PAY }?.let { id ->
                 coinjoin.destWhichOf(st.poolId) ?: destinations.list().firstOrNull { it.id == id }?.which() ?: "another wallet (removed since)" } ?: JSONObject.NULL)
             .put("v5", st.terms.v5).put("payments", JSONArray(st.terms.payments)).put("mixTotal", st.terms.mixTotal)
+            // Kilojoin v6: the windows, whether the creator recorded our yes, our outputs acknowledged, and coins held after signing.
+            .put("v6", st.terms.v6).also { o -> st.terms.async?.let { o.put("async", it.toJson()) } }
+            .put("voteRecorded", st.voteAcked != null && st.voteAcked == st.voteId)
+            .put("outputsAcked", st.handedIn.size).put("final", st.terms.async?.final ?: 0)
+            .put("reserved", coinjoin.sessionOrNull(st.poolId)?.reserved == true)
+            .put("sending", st.terms.v6 && !st.postedSig && coinjoin.sessionOrNull(st.poolId)?.signed == true)
             // A payment through the pool: what it pays, and to whom (only on this server, never announced).
             .put("pay", coinjoin.isPay(st.poolId))
             .put("recipients", if (!coinjoin.isPay(st.poolId)) JSONArray() else JSONArray(st.mixScripts.mapIndexed { i, sp ->
@@ -1018,7 +1027,7 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
     })
 
     companion object {
-        const val VERSION = "0.10.0-beta1"
+        const val VERSION = "0.10.0"
         /** How far (per branch) a replaced transaction's coins are looked up in this wallet. */
         const val OURS = 400
 

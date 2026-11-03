@@ -12,6 +12,7 @@ import java.io.File
  *   KILOWALLET_ARKD    the Ark engine binary (default /opt/kilowallet/kilombino-arkd)
  *   KILOWALLET_NETWORK coinjoin network name (default blake2b; tests use another, so their
  *                      pools never list on mainnet)
+ *   KILOWALLET_RELAY   tests only, with a test KILOWALLET_NETWORK: a local relay (plain ws:// on the loopback)
  *
  * On mainnet (KILOWALLET_NETWORK blake2b) the server first checks that the node follows the
  * BLAKE2b chain ([ChainCheck]) and refuses to work with one on the SHA-256 chain.
@@ -19,6 +20,12 @@ import java.io.File
 fun main() {
     val env = System.getenv()
     env["KILOWALLET_NETWORK"]?.let { com.kilombino.pyblockwatch.coinjoin.Protocol.NETWORK = it; NodeWallet.testnet = it != "blake2b" }
+    // A test may use a relay of its own, so a test pool never reaches relay.kilombino.com at all.
+    // Only with a test network: a real node always uses the real relay.
+    env["KILOWALLET_RELAY"]?.let { r ->
+        require(com.kilombino.pyblockwatch.coinjoin.Protocol.NETWORK != "blake2b") { "KILOWALLET_RELAY needs a test KILOWALLET_NETWORK" }
+        com.kilombino.pyblockwatch.coinjoin.Protocol.RELAY = r
+    }
     val dir = File(env["KILOWALLET_DATA"] ?: "/data").apply { mkdirs() }
     val rpc = Rpc(env["BITCOIN_RPC_URL"] ?: "http://127.0.0.1:8332/", env["BITCOIN_RPC_USER"], env["BITCOIN_RPC_PASS"], env["BITCOIN_RPC_COOKIE"])
     val port = (env["KILOWALLET_PORT"] ?: "8080").toInt()

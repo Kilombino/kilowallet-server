@@ -122,7 +122,9 @@ function poolTypeLine(t_) {
     (t_.maxInputs > 1 ? ` · up to ${t_.maxInputs} coins each` : ' · one coin each') +
     (t_.v5 ? ' · ' + (t_.outputs > 1 ? `a payment pool (v5): the creator pays ${(t_.payments || []).length} recipient(s); you get ${groupSats(t_.mixTotal)} in ${t_.outputs} equal outputs`
       : `a payment pool (v5): the creator pays ${(t_.payments || []).length} recipient(s); you get ${groupSats(t_.mixTotal)} in one output`)
-      : t_.outputs > 1 ? ` · ${t_.outputs} outputs each (v4)` : t_.version >= 3 ? ' · blind outputs (v3)' : '');
+      : t_.outputs > 1 ? ` · ${t_.outputs} outputs each (v4)` : t_.version >= 3 ? ' · blind outputs (v3)' : '') +
+    // Kilojoin v6: an asynchronous pool, and its windows in minutes.
+    (t_.async ? ` · asynchronous (v6): ${Math.round(t_.async.vote / 60)} min to answer, ${Math.round(t_.async.outputs / 60)} for outputs, ${Math.round(t_.async.sign / 60)} to sign` : '');
 }
 
 function openPools(mine, accent) {
@@ -191,7 +193,7 @@ function roundCard(p, accent) {
     OPEN: `Waiting for people · ${p.people}/${p.maxPeers} people · closes at ${hhmm(p.expiresAt)}`,
     VOTING: needsMe(p) ? `Closing vote · your answer, by ${hhmm(p.voteDeadline)}` : `Closing vote · ${p.people} people`,
     CLOSING: `Closing · ${p.people} people · collecting outputs`,
-    SIGNING: p.signed ? 'Signed · waiting for the others' : needsMe(p) ? 'Ready to sign' : 'Signing',
+    SIGNING: p.signed && p.v6 && (p.reserved || p.reason) ? 'Signed · coins held until the round resolves' : p.signed ? 'Signed · waiting for the others' : needsMe(p) ? 'Ready to sign' : 'Signing',
     BROADCAST: 'Sent · waiting for a block', CONFIRMED: 'Confirmed', ABORTED: 'Cancelled', REJECTED: 'Refused',
   }[p.phase] || p.phase;
   const pay = p.pay;
@@ -263,13 +265,20 @@ function myPool(p, accent, color) {
       break;
     }
     case 'VOTING':
-      if (p.iAsked || p.voted) kids.push(t(`Waiting for the others to answer, until ${hhmm(p.voteDeadline)}. Whoever has not answered by then is left out; if too few are left, the pool reopens without them.`, 'bs c-soft'), spacer(6),
+      // Kilojoin v6: a yes sent is not yet a yes recorded; nobody is left out without being asked again.
+      if ((p.iAsked || p.voted) && p.v6) kids.push(t(p.voteRecorded ? "Your yes is recorded by the pool's creator." : 'Your yes is sent; waiting for the creator to record it.', 'bs', { style: { color: p.voteRecorded ? COLORS.good : COLORS.soft } }),
+        t(`Waiting for the others to answer, until ${hhmm(p.voteDeadline)}. You can close the app. If someone doesn't answer, they leave the pool and the rest are asked again: it never closes with fewer people without asking.`, 'bs c-soft'), spacer(6),
+        b(p.creator ? 'CANCEL POOL' : 'LEAVE', false, leave));
+      else if (p.iAsked || p.voted) kids.push(t(`Waiting for the others to answer, until ${hhmm(p.voteDeadline)}. Whoever has not answered by then is left out; if too few are left, the pool reopens without them.`, 'bs c-soft'), spacer(6),
         b(p.creator ? 'CANCEL POOL' : 'LEAVE', false, leave));
       else kids.push(t(`Answer before ${hhmm(p.voteDeadline)}.`, 'bs c-soft'),
         row('gap8', b('ACCEPT', true, () => cjAct('coinjoin/vote', { pool: p.id, accept: true }), true), b('NOT YET', false, () => cjAct('coinjoin/vote', { pool: p.id, accept: false }), true)));
       break;
     case 'SIGNING':
-      if (p.signed) kids.push(t(`Signed. Waiting for the others (${p.sigs}/${p.planCoins || '?'} coins)…`, 'bs c-soft'));
+      if (p.reserved) kids.push(t('Signed, and the time to sign is over without every signature. Your coins stay held: the transaction can still go out if the last signatures arrive. They are free once it confirms, or once a coin of the round is spent elsewhere.', 'bs c-warn'));
+      else if (p.signed && p.v6) kids.push(t(`Signed, and the relay has your signature: you can close the app. Whoever has every signature sends the transaction. (${p.sigs}/${p.planCoins || '?'} coins)`, 'bs c-soft'));
+      else if (p.sending) kids.push(t('Signed. Sending your signature to the relay…', 'bs c-soft'));
+      else if (p.signed) kids.push(t(`Signed. Waiting for the others (${p.sigs}/${p.planCoins || '?'} coins)…`, 'bs c-soft'));
       else {
         if (p.planPeople) {
           const ppl = p.planPeople, n = p.planCoins, same = p.planIdentical, each = groupSats(p.amount), total = groupSats(p.planFee), mine = p.outputs;
@@ -447,7 +456,10 @@ function createForm(accent) {
     fld(`most people (${L.minPeers}–${L.maxPeers})`, 'max', 'numeric'),
     fld('open for (hours)', 'hours', 'numeric'),
     fld(`most coins per person (1–${L.maxInputs})`, 'inputs', 'numeric'),
-    v5 ? t('Only Kilowallet 1.2.7 or newer (Kilojoin v5) sees this pool.', 'bs c-faint')
+    // Kilojoin v6: asynchronous rounds; such a pool is v6 whatever else it is, and the text says who sees it.
+    radioLine(!!f.async, 'Asynchronous rounds (Kilojoin v6)', accent, () => { f.async = !f.async; render(); }),
+    f.async ? t('For people who answer at different times: up to an hour to answer, 30 minutes for the outputs and two hours to sign, with an end time no round goes past. Nobody is left out of a round without being asked again. As its creator, this server runs the pool: keep it running until the round is done. Only wallets that know Kilojoin v6 see these pools.', 'bs c-faint')
+    : v5 ? t('Only Kilowallet 1.2.7 or newer (Kilojoin v5) sees this pool.', 'bs c-faint')
       : Number(f.outputs || 1) === 1 ? t(f.script !== 'p2tr' && Number(f.inputs) === 1 ? 'One coin each: Kilowallet versions before 0.27 can join it too.' : 'Only Kilowallet 0.27 or newer sees this pool.', 'bs c-faint') : null,
     field({ label: 'password (optional: makes it private 🔒)', size: 'bm', value: f.password, oninput: v => { f.password = v; update(); } }), pwNote,
     costs, errBox, spacer(10), row('gap8', back, next));
@@ -460,7 +472,7 @@ async function openFromCoins(P, dest) {
   let pw; try { pw = await askPassword('Open a coinjoin pool', 'Unlock to put your coins in'); } catch { return; }
   try {
     const r = await api('coinjoin/create', { coins: P.picked.map(c => c.outpoint), script: P.t, maxInputs: Number(f.inputs), outputs: P.o, fromCoins: true, amount: P.amount,
-      feeRate: P.rate, minPeers: Number(f.min), maxPeers: Number(f.max), hours: Number(f.hours), poolPassword: f.password, password: pw, dest: dest || '' });
+      feeRate: P.rate, minPeers: Number(f.min), maxPeers: Number(f.max), hours: Number(f.hours), poolPassword: f.password, password: pw, dest: dest || '', async: !!f.async });
     C.create = null; C.cjTab = 1; toast(`Pool opened (${poolAmount(r.amount, r.outputs)} sats, no change): others are told about it.`);
     await loadCoinjoin(); render(); reloadPools(); window.scrollTo(0, 0);
   } catch (e) { toast(e.message); }
@@ -528,7 +540,7 @@ function coinPicker(accent) {
       if (C.create) {
         const f = C.create;
         await api('coinjoin/create', { coins: C.chosen, script: t_, maxInputs: maxIn, outputs: pay ? Number(f.outputs) || 1 : o, amount: k.amount, feeRate: k.rate, minPeers: Number(f.min), maxPeers: Number(f.max),
-          hours: Number(f.hours), poolPassword: f.password, password: pw, dest: C.dest || '', pay: pay ? pay.recipients : undefined, paymentPool: !!v5 });
+          hours: Number(f.hours), poolPassword: f.password, password: pw, dest: C.dest || '', pay: pay ? pay.recipients : undefined, paymentPool: !!v5, async: !!f.async });
         C.create = null; toast(pay ? 'Pool opened: the payment goes out when it closes.' : 'Pool opened: others are told about it.');
       } else {
         if (C.join.pool.private && !C.join.password) return toast("Type the pool's password first.");
@@ -590,7 +602,7 @@ function coinPicker(accent) {
 
 function startExact(exact, script) {
   const after = C.create && C.pick ? { create: { amount: C.pick.amount, feeRate: C.pick.rate, minPeers: Number(C.create.min), maxPeers: Number(C.create.max),
-    hours: Number(C.create.hours), poolPassword: C.create.password || '', maxInputs: C.pick.maxInputs || 1, outputs: C.pick.outputs || 1 } }
+    hours: Number(C.create.hours), poolPassword: C.create.password || '', maxInputs: C.pick.maxInputs || 1, outputs: C.pick.outputs || 1, async: !!C.create.async } }
     : C.join ? { pool: C.join.pool.id, poolPassword: C.join.password || '' } : null;
   C.exact = { exact, script, after, dest: C.dest || '', picked: [], rate: '', suggested: undefined, phase: 'edit' };
   api('fee').then(r => { C.exact.suggested = r.suggested; if (!C.exact.rate) C.exact.rate = fmtRate(Math.max(1, r.suggested || 1)); if (!busy() || C.exact) render(); }).catch(() => { C.exact.suggested = null; C.exact.rate = '1'; render(); });

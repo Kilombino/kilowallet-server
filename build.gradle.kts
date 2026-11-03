@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "com.kilombino.kilowallet"
-version = "0.10.0-beta1"
+version = "0.10.0"
 
 kotlin {
     jvmToolchain(17)
@@ -34,14 +34,32 @@ sourceSets {
             include("com/kilombino/pyblockwatch/data/JoinMarket.kt")
         }
     }
+    test {
+        kotlin {
+            srcDir("src/test/kotlin")
+            // The app's own coinjoin tests that need nothing of Android: a local relay and the async rounds (Kilojoin v6).
+            srcDir("kilowallet/app/src/test/java")
+            include("com/kilombino/kilowallet/**")
+            include("com/kilombino/pyblockwatch/coinjoin/TestRelay.kt")
+            include("com/kilombino/pyblockwatch/coinjoin/TestChain.kt")
+            include("com/kilombino/pyblockwatch/coinjoin/AsyncRoundsTest.kt")
+            include("com/kilombino/pyblockwatch/coinjoin/AsyncRoundsE2ETest.kt")
+        }
+    }
 }
 
 dependencies {
     implementation("org.json:json:20240303")
     testImplementation(kotlin("test"))
+    // The app's tests are JUnit 4; they run here on the JUnit Platform's vintage engine.
+    testImplementation("junit:junit:4.13.2")
+    testRuntimeOnly("org.junit.vintage:junit-vintage-engine:5.10.2")
 }
 
-tasks.test { useJUnitPlatform() }
+tasks.test {
+    useJUnitPlatform()
+    testLogging { events("failed", "skipped"); exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL }
+}
 
 // The web page speaks the app's languages: its translation tables, straight from the Kilowallet submodule.
 tasks.processResources { from("kilowallet/app/src/main/assets/i18n") { into("web/i18n") } }
