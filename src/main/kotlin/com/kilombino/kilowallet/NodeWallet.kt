@@ -160,9 +160,33 @@ class NodeWallet(private val dir: File, private val rpc: Rpc, accountKey: String
     /** Look back again for older history (a restored wallet on an unpruned node). Slow. */
     fun rescan(fromHeight: Int) { rpc.call("rescanblockchain", fromHeight, timeoutMs = 6 * 3_600_000, wallet = name) }
 
-    fun balance(): Pair<Long, Long> {
+    /**
+     * What the node's wallet holds: [confirmed] and [pending] can be spent (and are the balance);
+     * [immature] is mined rewards still maturing, never spendable until the node says so.
+     */
+    data class Balance(val confirmed: Long, val pending: Long, val immature: Long)
+
+    fun balance(): Balance {
         val m = (rpc.call("getbalances", wallet = name) as JSONObject).let { it.optJSONObject("mine") ?: it.getJSONObject("watchonly") }
-        return sats(m.getDouble("trusted")) to sats(m.getDouble("untrusted_pending"))
+        return Balance(sats(m.getDouble("trusted")), sats(m.getDouble("untrusted_pending")), sats(m.optDouble("immature", 0.0)))
+    }
+
+    @Volatile private var maturingCache: Pair<String, List<Maturity.Coin>>? = null
+
+    /**
+     * The wallet's mined rewards still maturing, as the node's wallet lists them (category
+     * "immature"): only the blocks young enough to hold one are looked through, once per tip.
+     */
+    fun maturing(tipHash: String, tip: Int): List<Maturity.Coin> {
+        maturingCache?.let { (h, l) -> if (h == tipHash) return l }
+        val from = tip - Maturity.LONG_MATURITY
+        val since = if (from <= 0) "" else rpc.call("getblockhash", from) as String
+        val r = (rpc.call("listsinceblock", since, 1, true, wallet = name) as JSONObject).getJSONArray("transactions")
+        val l = (0 until r.length()).map { r.getJSONObject(it) }.filter { it.optString("category") == "immature" }
+            .map { Maturity.Coin(it.getString("txid"), it.optInt("vout"), sats(it.getDouble("amount")), it.optInt("blockheight")) }
+            .distinctBy { it.txid to it.vout }
+        maturingCache = tipHash to l
+        return l
     }
 
     fun utxos(): List<Utxo> {
@@ -203,8 +227,13 @@ class NodeWallet(private val dir: File, private val rpc: Rpc, accountKey: String
             val t = runCatching { rpc.call("gettransaction", txid, true, wallet = name) as JSONObject }.getOrNull() ?: return@mapNotNull null
             // amount leaves change out; with the fee it is exactly what the wallet gained or lost.
             val fee = if (t.has("fee")) sats(-t.getDouble("fee")) else null
-            val tx = Tx(txid, sats(t.getDouble("amount")) - (fee ?: 0), t.optInt("confirmations"), t.optLong("time"), fee)
-            if (tx.confirmations >= 6) txCache[txid] = tx
+            // A mined reward still maturing has "amount" 0: what it brings is in its details. Not
+            // kept until it matures, or it would stay at 0 once it does.
+            val maturing = if (!t.optBoolean("generated")) 0L else t.optJSONArray("details")?.let { d ->
+                (0 until d.length()).map { d.getJSONObject(it) }.filter { it.optString("category") == "immature" }.sumOf { sats(it.getDouble("amount")) }
+            } ?: 0L
+            val tx = Tx(txid, sats(t.getDouble("amount")) + maturing - (fee ?: 0), t.optInt("confirmations"), t.optLong("time"), fee)
+            if (tx.confirmations >= 6 && maturing == 0L) txCache[txid] = tx
             tx
         }.filter { t ->
             // A pending one that is no longer in the mempool was replaced (RBF) or dropped: not a movement.

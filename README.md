@@ -14,6 +14,12 @@ phone, that reads the chain straight from your own node — no Electrum server.
 
 - **One person, one node.** The node gets a *watch-only* descriptor wallet (the account key only,
   no private keys), which tracks history, the mempool and balances, pruned node included.
+- **Mined coins still maturing** (the node's `getbalances` `immature`) are not in the balance and
+  never spendable; `/api/wallet` gives `immature` and `maturing` (each coin from `listsinceblock`,
+  category `immature`, looked up once per tip and only when there are any: height, `unlockHeight` =
+  height + the app's maturity — 100, 6 480 from block 973 440, 25 920 from 979 919 —, the tip at which
+  the node's wallet frees it, and an estimated `unlockTime`
+  from the last 144 blocks' pace, 10 min a block when that can't be read).
 - **The keys never enter the node.** A hot wallet's words are encrypted on disk with your password
   (PBKDF2 600 000 rounds + AES-256-GCM) and asked for again before each send. Every input is signed
   with the unified sighash (0x21), so a spend can't be replayed on the SHA-256 chain.

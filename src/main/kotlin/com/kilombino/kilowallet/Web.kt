@@ -981,15 +981,23 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
         val o = JSONObject().put("mode", mode()).put("type", type().name).put("node", w.name)
         walletError?.let { return o.put("error", it) }
         if (importing) return o.put("importing", true)
-        val (conf, pending) = runCatching {
-            wallets().map { it.balance() }.fold(0L to 0L) { a, x -> (a.first + x.first) to (a.second + x.second) }
-        }.getOrElse { return o.put("error", it.message ?: "node error") }
+        val bals = runCatching { wallets().map { it to it.balance() } }.getOrElse { return o.put("error", it.message ?: "node error") }
+        val conf = bals.sumOf { it.second.confirmed }; val pending = bals.sumOf { it.second.pending }
+        // Mined rewards still maturing: not in the balance, never spendable, shown apart.
+        val immature = bals.sumOf { it.second.immature }
+        val maturing = if (immature <= 0) null else runCatching {
+            val tipHash = rpc.call("getbestblockhash") as String
+            val tip = (rpc.call("getblockheader", tipHash) as JSONObject).getInt("height")
+            val coins = bals.filter { it.second.immature > 0 }.flatMap { it.first.maturing(tipHash, tip) }
+            Maturity.json(immature, coins, tip, Maturity.pace(rpc, tipHash, tip))
+        }.getOrElse { JSONObject().put("total", immature).put("coins", JSONArray()).put("estimate", true) }
         // One movement per transaction: one that touches both accounts adds up what it did to each.
         val txs = wallets().flatMap { x -> runCatching { x.transactions() }.getOrDefault(emptyList()) }
             .groupBy { it.txid }.values.map { g ->
                 NodeWallet.Tx(g[0].txid, g.sumOf { it.net }, g.maxOf { it.confirmations }, g.maxOf { it.time }, g.mapNotNull { it.fee }.maxOrNull())
             }.sortedWith(compareBy({ it.confirmations > 0 }, { if (it.confirmations > 0) it.confirmations.toLong() else -it.time }))
-        var left = conf + pending
+        // Mined rewards still maturing are among the movements: what was left after each counts them.
+        var left = conf + pending + immature
         val txArr = JSONArray()
         for (t in txs) {
             txArr.put(JSONObject().put("txid", t.txid).put("net", t.net).put("confirmations", t.confirmations)
@@ -999,7 +1007,8 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
         val utxos = wallets().flatMap { it.utxos() }.sortedByDescending { it.value }
         val (ri, ra) = w.receive()
         val locked = coinjoin.lockedOutpoints(); val mixed = coinjoin.mixedScripts()
-        o.put("confirmed", conf).put("pending", pending).put("transactions", txArr)
+        o.put("confirmed", conf).put("pending", pending).put("immature", immature).put("transactions", txArr)
+            .apply { maturing?.let { put("maturing", it) } }
             .put("coins", JSONArray(utxos.map { u ->
                 JSONObject().put("outpoint", u.outpoint).put("value", u.value).put("confirmations", u.confirmations)
                     .put("address", walletOf(u).address(u.branch, u.index)).put("change", u.branch == 1)

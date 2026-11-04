@@ -619,10 +619,28 @@ function balanceCard(w, accent) {
     spacer(8),
     row('', t(street('≈ ' + (value || fiatMissing(S.fiat))), 'hs c-main grow'), fiatPicker(accent)),
     w.pending ? [spacer(4), t(street(`unconfirmed: ${groupSats(w.pending)} sats`), 'bs c-warn')] : null,
+    maturingLine(w),
     spacer(10),
     t(`${usedCount} used addresses · height ${w.height || 0}`, 'bs c-soft'),
     t(SCRIPT_TYPES[type] ? `${SCRIPT_TYPES[type][0]} — ${SCRIPT_TYPES[type][1]}` : '', 'bs c-faint'),
     spacer(6), explain('BTC: Bitcoin with BLAKE2b proof of work. 164-byte headers.'));
+}
+/**
+ * Under the balance: mined rewards still maturing (not in the balance, SEND can't use them), and,
+ * opened, each one with the block it unlocks at and about when (an estimate from the recent pace).
+ */
+function maturingLine(w) {
+  const m = w.maturing;
+  if (!w.immature || !m) return null;
+  const open = safeGet('kw.matOpen') === '1';
+  const head = h('div', { class: 'row rowtap', onclick: () => { safeSet('kw.matOpen', open ? null : '1'); render(); } },
+    t(street(`Maturing (mined): ${groupSats(w.immature)} sats`), 'bs c-warn grow'), t(R(open ? '▾' : '▸'), 'bs c-warn'));
+  if (!open) return [spacer(4), head];
+  const day = s => new Date(s * 1000).toISOString().slice(0, 10);
+  const coins = (m.coins || []).map(c => col('', t(R(street(`${groupSats(c.value)} sats`)), 'bs c-main'),
+    t(`⛏ mined reward · matures at block ${c.unlockHeight} (~${day(c.unlockTime)})`, 'bs c-warn')));
+  return [spacer(4), head, spacer(4), col('gap6', coins),
+    spacer(4), explain('Mined coins can be spent only once they mature: they are not in the balance and SEND cannot use them yet. The dates are an estimate from the pace of recent blocks.')];
 }
 const SCRIPT_TYPES = { P2PKH: ['Legacy', "Addresses that start with 1. Bitcoin's original format."], P2SH_P2WPKH: ['Nested SegWit', 'Addresses that start with 3. SegWit wrapped for older wallets.'],
   P2WPKH: ['Native SegWit', 'Addresses that start with bc1q. The most widely used.'], P2TR: ['Taproot', 'Addresses that start with bc1p. The newest, and cheaper to spend.'] };

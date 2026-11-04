@@ -334,6 +334,15 @@ const WEB_I18N = (() => {
       'Für Leute, die zu verschiedenen Zeiten antworten: bis zu einer Stunde zum Antworten, 30 Minuten für die Ausgaben und zwei Stunden zum Signieren, mit einer Endzeit, die keine Runde überschreitet. Niemand fällt aus einer Runde, ohne erneut gefragt zu werden. Als Ersteller führt dieser Server den Pool: lass ihn laufen, bis die Runde fertig ist. Nur Wallets, die Kilojoin v6 kennen, sehen diese Pools.',
       'Para quem responde em momentos diferentes: até uma hora para responder, 30 minutos para as saídas e duas horas para assinar, com uma hora final que nenhuma ronda ultrapassa. Ninguém fica fora de uma ronda sem que lhe voltem a perguntar. Como criador, este servidor conduz o pool: mantém-no a funcionar até a ronda acabar. Só as carteiras que conhecem Kilojoin v6 veem estes pools.',
       '适合在不同时间回应的人：最多一小时回应，30 分钟提交输出，两小时签名，并有任何轮次都不会超过的结束时间。不会有人在未被再次询问的情况下被排除出一轮。作为创建者，这台服务器负责运行这个池：保持它运行直到这一轮结束。只有支持 Kilojoin v6 的钱包能看到这些池。'],
+    'Maturing (mined): {0} sats': ['Madurando (minado): {0} sats', 'Madurant (minat): {0} sats', 'En maturation (miné) : {0} sats', 'In maturazione (minato): {0} sats', 'Reifend (gemined): {0} sats', 'A amadurecer (minerado): {0} sats', '成熟中（挖矿）：{0} sats'],
+    'Mined coins can be spent only once they mature: they are not in the balance and SEND cannot use them yet. The dates are an estimate from the pace of recent blocks.': [
+      'Las monedas minadas solo se pueden gastar cuando maduran: no están en el saldo y ENVIAR aún no puede usarlas. Las fechas son una estimación según el ritmo de los últimos bloques.',
+      'Les monedes minades només es poden gastar quan maduren: no són al saldo i ENVIAR encara no les pot fer servir. Les dates són una estimació segons el ritme dels últims blocs.',
+      'Les pièces minées ne peuvent être dépensées qu\'une fois mûres : elles ne sont pas dans le solde et ENVOYER ne peut pas encore les utiliser. Les dates sont une estimation d\'après le rythme des derniers blocs.',
+      'Le monete minate si possono spendere solo quando maturano: non sono nel saldo e INVIA non può ancora usarle. Le date sono una stima dal ritmo degli ultimi blocchi.',
+      'Geminte Münzen lassen sich erst ausgeben, wenn sie gereift sind: sie sind nicht im Guthaben und SENDEN kann sie noch nicht verwenden. Die Daten sind eine Schätzung nach dem Tempo der letzten Blöcke.',
+      'As moedas mineradas só se podem gastar quando amadurecem: não estão no saldo e ENVIAR ainda não as pode usar. As datas são uma estimativa pelo ritmo dos últimos blocos.',
+      '挖到的币只有成熟后才能花费：它们不在余额中，发送暂时无法使用。日期是根据最近区块的速度估算的。'],
   };
   const langs = ['es', 'ca', 'fr', 'it', 'de', 'pt', 'zh'];
   const out = {};
