@@ -194,7 +194,8 @@ function roundCard(p, accent) {
     VOTING: needsMe(p) ? `Closing vote · your answer, by ${hhmm(p.voteDeadline)}` : `Closing vote · ${p.people} people`,
     CLOSING: `Closing · ${p.people} people · collecting outputs`,
     SIGNING: p.signed && p.v6 && (p.reserved || p.reason) ? 'Signed · coins held until the round resolves' : p.signed ? 'Signed · waiting for the others' : needsMe(p) ? 'Ready to sign' : 'Signing',
-    BROADCAST: 'Sent · waiting for a block', CONFIRMED: 'Confirmed', ABORTED: 'Cancelled', REJECTED: 'Refused',
+    BROADCAST: (p.reason || '').startsWith('not sent yet') ? 'Signed · not sent yet, it goes again'
+      : p.confs > 0 ? `Sent · confirmed ${p.confs}/6` : 'Sent · waiting for a block', CONFIRMED: 'Confirmed', ABORTED: 'Cancelled', REJECTED: 'Refused',
   }[p.phase] || p.phase;
   const pay = p.pay;
   const where = p.phase === 'BROADCAST' ? (pay ? 'The payment left in the group transaction. Waiting for a block.' : 'Your coin left in the group transaction. Waiting for a block.')

@@ -812,7 +812,7 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
         val plan = runCatching { coinjoin.session(st.poolId).plan() }.getOrNull()
         val people = if (st.round.isNotEmpty()) st.round.size else st.seats.size
         return JSONObject().put("id", st.poolId).put("amount", st.terms.amount).put("feeRate", st.terms.feeRate).put("outputs", st.terms.outputs)
-            .put("creator", st.creator).put("private", st.terms.private).put("phase", st.phase.name).put("reason", st.reason)
+            .put("creator", st.creator).put("private", st.terms.private).put("phase", st.phase.name).put("reason", st.reason).put("confs", st.confs)
             .put("people", people).put("minPeers", st.terms.minPeers).put("maxPeers", st.terms.maxPeers)
             .put("expiresAt", st.terms.expiresAt).put("phaseDeadline", st.phaseDeadline).put("voteDeadline", st.voteDeadline)
             .put("coinValue", st.seat.inputValue).put("coins", st.seat.coins.size).put("change", st.seat.changeValue)

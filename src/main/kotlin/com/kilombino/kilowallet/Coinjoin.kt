@@ -154,8 +154,11 @@ class Coinjoin(private val dir: File, private val rpc: Rpc, private val walletPr
      */
     fun live(): List<PoolSession.State> = sessions.values.filter { !it.done && it.state.phase != PoolSession.Phase.BROADCAST }.map { it.state }
 
-    /** Coins promised to a round that has not gone out: a normal send must not touch them. */
-    fun lockedOutpoints(): Set<String> = live().flatMap { st -> st.seat.coins.map { it.outpoint } }.toSet()
+    /**
+     * Coins promised to a round not over: a normal send must not touch them. A round sent but not seen (its broadcast
+     * failed, or it was reorged out) holds them too, every version, until it confirms 6 deep or is given up.
+     */
+    fun lockedOutpoints(): Set<String> = sessions.values.filter { !it.done }.flatMap { s -> s.state.seat.coins.map { it.outpoint } }.toSet()
 
     /** The wallet is being forgotten: its rounds go with it. */
     fun clear() {
@@ -424,12 +427,34 @@ class Coinjoin(private val dir: File, private val rpc: Rpc, private val walletPr
         override fun broadcast(rawHex: String): String = rpc.call("sendrawtransaction", rawHex) as String
         override fun confirmations(txid: String): Int? {
             // The round pays this wallet, so its node wallet knows it (pruned node, no txindex).
+            // 0 there only while it is in the mempool: a transaction reorged out and dropped stays in the wallet with 0,
+            // and then it is not seen (the round sends it again).
             for (w in walletProvider()) {
                 runCatching { rpc.call("gettransaction", txid, true, wallet = w.name) as JSONObject }.getOrNull()
-                    ?.optInt("confirmations", -1)?.takeIf { it >= 0 }?.let { return it }
+                    ?.optInt("confirmations", -1)?.takeIf { it >= 0 }
+                    ?.let { if (it > 0 || runCatching { rpc.call("getmempoolentry", txid) }.isSuccess) return it }
             }
             for (i in 0 until 60) { rpc.txOut(txid, i)?.let { return it.optInt("confirmations") } }
             return runCatching { (rpc.call("getrawtransaction", txid, true) as JSONObject).optInt("confirmations") }.getOrNull()
+        }
+        override fun conflictDepth(coin: CoinjoinTx.Coin, roundTxid: String): Int? {
+            // As Kilojoin: unspent (the mempool included), nothing spends it.
+            if (rpc.txOut(coin.txid, coin.vout) != null) return null
+            // Spent in the mempool: 0 deep (unless the round itself spends it).
+            val m = rpc.call("gettxspendingprevout", JSONArray().put(JSONObject().put("txid", coin.txid).put("vout", coin.vout))) as JSONArray
+            m.optJSONObject(0)?.optString("spendingtxid")?.takeIf { it.isNotEmpty() }?.let { return if (it == roundTxid) null else 0 }
+            // Spent in a block: looked for in the newest DEPTH - 1 blocks (no txindex needed); not there, it is deeper.
+            val tip = rpc.height()
+            for (d in 1 until PoolSession.DEPTH) {
+                val b = rpc.call("getblock", rpc.call("getblockhash", tip - d + 1), 2) as JSONObject
+                val txs = b.getJSONArray("tx")
+                for (i in 0 until txs.length()) {
+                    val tx = txs.getJSONObject(i); val vin = tx.getJSONArray("vin")
+                    if ((0 until vin.length()).any { vin.getJSONObject(it).optString("txid") == coin.txid && vin.getJSONObject(it).optInt("vout", -1) == coin.vout })
+                        return if (tx.getString("txid") == roundTxid) null else d
+                }
+            }
+            return PoolSession.DEPTH
         }
         override fun save(state: PoolSession.State) {
             if (state.phase == PoolSession.Phase.ABORTED && state.reason == PoolSession.LEFT_BY_CHOICE) {
