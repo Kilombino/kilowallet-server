@@ -1034,15 +1034,32 @@ function txDetail(tx, accent, statusText, o) {
         api('settings', { explorer: 'https://mempool.kilombino.com' }).then(s => { S.w.settings = s; safeSet('kw.explorerChosen', '1'); openIt('https://mempool.kilombino.com'); d.close(); }).catch(e => toast(e.message));
       }));
   };
-  const body = [t(status, 'bs', { style: { color: accent } }), o.extra || null, t(R(id), 'bs c-main brk'),
+  const statusEl = t(status, 'bs', { style: { color: accent } });
+  const body = [statusEl, o.extra || null, t(R(id), 'bs c-main brk'),
     row('gap8 wrap', copyButton(kind === 'address' ? '📋 COPY ADDRESS' : '📋 COPY TXID', () => id, accent),
       tbtn('🔎 EXPLORER', accent, () => explorerChosen() ? openIt(explorer()) : askExplorer())),
     confirmBox];
+  const bumps = h('div', { class: 'col gap6' });
   if (tx && pending && isHot() && kind === 'tx' && tx.net !== undefined && !o.noBump) {
-    body.push(tbtn(tx.net > 0 ? '⚡ SPEED UP (CPFP)' : '⚡ SPEED UP (RBF)', accent, () => { d.close(); bumpDialog(tx, tx.net > 0 ? 'cpfp' : 'rbf', accent); }));
-    if (tx.net <= 0) body.push(tbtn('✕ CANCEL (RBF)', COLORS.warn, () => { d.close(); bumpDialog(tx, 'cancel', accent); }));
+    bumps.append(tbtn(tx.net > 0 ? '⚡ SPEED UP (CPFP)' : '⚡ SPEED UP (RBF)', accent, () => { d.close(); bumpDialog(tx, tx.net > 0 ? 'cpfp' : 'rbf', accent); }));
+    if (tx.net <= 0) bumps.append(tbtn('✕ CANCEL (RBF)', COLORS.warn, () => { d.close(); bumpDialog(tx, 'cancel', accent); }));
   }
-  const d = dialog({ title: kind === 'address' ? 'Address' : 'Transaction', body, buttons: [tbtn('CLOSE', COLORS.soft, () => d.close())] });
+  body.push(bumps);
+  // A movement's dialog follows its live state (as the app since 1.5.6): page refreshes wait while a
+  // dialog is open, so this one asks for the wallet itself and updates its line.
+  let timer = null;
+  if (kind === 'tx' && !statusText && pending) {
+    timer = setInterval(async () => {
+      const w = await api('wallet').catch(() => null); if (!w) return;
+      S.w = w;
+      const cur = (w.transactions || []).find(x => x.txid === id); if (!cur || !cur.confirmations) return;
+      statusEl.textContent = tr(`${cur.confirmations} confirmation` + (cur.confirmations === 1 ? '' : 's'));
+      bumps.replaceChildren();
+      clearInterval(timer); timer = null;
+    }, REFRESH * 1000);
+  }
+  const d = dialog({ title: kind === 'address' ? 'Address' : 'Transaction', body, buttons: [tbtn('CLOSE', COLORS.soft, () => d.close())],
+    onclose: () => { if (timer) clearInterval(timer); } });
 }
 
 /** Speed up an unconfirmed send (RBF), pull a payment along (CPFP), or cancel a send (BumpDialog). */

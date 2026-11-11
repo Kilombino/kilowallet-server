@@ -23,9 +23,10 @@ async function loadCoinjoin() { C.st = await api('coinjoin'); }
 async function reloadPools() {
   if (C.loading || !cjOpen()) return;
   C.loading = true; if (!busy()) render();
-  try { C.pools = await api('coinjoin/pools'); }
+  // The relay's state has its own line, recomputed on every look: it never covers a join or round error.
+  try { C.pools = await api('coinjoin/pools'); C.relayError = null; }
   // A failed look keeps the list it had: an empty screen would read as "no pools".
-  catch (e) { if (e.message !== 'locked') C.msg = 'Could not reach the relay: ' + e.message; }
+  catch (e) { if (e.message !== 'locked') C.relayError = 'Could not reach the relay: ' + e.message; }
   C.loading = false;
   if (!busy()) render();
 }
@@ -77,6 +78,7 @@ function coinjoinScreen(accent) {
   if (st.blocker) return panel(accent, label('Coinjoin', accent), spacer(8), explain(st.blocker));
   const parts = [];
   if (C.msg) parts.push(panel(COLORS.warn, t(C.msg, 'bs c-warn'), tbtn('ok', COLORS.soft, () => { C.msg = null; render(); }, null, { style: { alignSelf: 'flex-start' } })));
+  if (C.relayError) parts.push(panel(COLORS.warn, t(C.relayError, 'bs c-warn')));
   if (C.exact) { parts.push(exactCoinPanel(accent)); return parts; }
   if (C.pick) { if (C.join && C.join.pool.private) parts.push(privatePoolPanel(accent)); parts.push(coinPicker(accent)); return parts; }
   if (C.create) { parts.push(C.create.confirm ? createConfirm(accent) : createForm(accent)); return parts; }
