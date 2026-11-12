@@ -240,7 +240,7 @@ function myPool(p, accent, color) {
     const box = h('div', { class: 'col' });
     kids.push(tbtn('show the addresses', accent, async () => {
       if (box.childNodes.length) return box.replaceChildren();
-      try { const l = await api('coinjoin/round/addresses', { pool: p.id }); box.replaceChildren(...l.map(a => [t(R(a.address), 'bs c-main brk'), t(R(a.path), 'ls c-faint'), spacer(4)])); } catch (e) { toast(e.message); }
+      try { const l = await api('coinjoin/round/addresses', { pool: p.id }); box.replaceChildren(...l.flatMap(a => [t(R(a.address), 'bs c-main brk'), t(R(a.path), 'ls c-faint'), spacer(4)])); } catch (e) { toast(e.message); }
     }, 'ls', { style: { padding: '0', alignSelf: 'flex-start' } }), box);
   }
   const auto = (C.st.settings || {}).auto_sign;
@@ -505,7 +505,7 @@ function destChooser(dests, t_, o, accent) {
         const l = await api('coinjoin/dest/preview', { dest: C.dest, script: t_, outputs: o });
         box.replaceChildren(t(l.length > 1 ? 'The next unused receive addresses of that wallet, as of now. Compare them with the wallet itself (in Sparrow or Shrike: Addresses › Receive).'
           : 'The next unused receive address of that wallet, as of now. Compare it with the wallet itself (in Sparrow or Shrike: Addresses › Receive).', 'bs c-faint'),
-        ...l.map(a => [t(R(a.address), 'bs c-main brk'), t(R(a.path), 'ls c-faint'), spacer(4)]));
+        ...l.flatMap(a => [t(R(a.address), 'bs c-main brk'), t(R(a.path), 'ls c-faint'), spacer(4)]));
       } catch (e) { toast(e.message); }
     }, 'ls', { style: { alignSelf: 'flex-start' } }) : null, box, spacer(8));
 }
