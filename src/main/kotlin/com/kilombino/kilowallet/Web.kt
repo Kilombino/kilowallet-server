@@ -26,7 +26,9 @@ import java.util.concurrent.Executors
  * again (the app's fingerprint). A hot wallet's words stay encrypted on disk ([Vault]) and in
  * memory only while unlocked.
  */
-class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc = ArkRpc(null, null, null, null)) {
+class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc = ArkRpc(null, null, null, null),
+          /** PAY THROUGH JOINBLAKET (the app since 1.6.0): its Tor proxy, or none. */
+          val joinblaket: JoinBlaket = JoinBlaket(dir, rpc, null)) {
     /** How the Ark engine reaches the node (the same RPC as the wallet's). */
     data class ArkRpc(val url: String?, val user: String?, val pass: String?, val cookie: String?)
     private val vault = Vault(dir)
@@ -230,6 +232,11 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
             val since = ex.requestURI.query?.substringAfter("since=")?.substringBefore('&')?.toLongOrNull() ?: 0L
             return reply(ex, 200, JSONArray(coinjoin.events.filter { it.at > since }.map { eventJson(it) }))
         }
+        // For the operator only (loopback): a read-only JoinBlaket check through Tor (directory, orderbook, bonds on the node).
+        if (p == "/internal/joinblaket/probe") {
+            if (!ex.remoteAddress.address.isLoopbackAddress) return reply(ex, 404, err("not found"))
+            return reply(ex, 200, runCatching { joinblaket.probe() }.getOrElse { e -> err(e.message ?: e.toString()) })
+        }
         // The BIP-39 word list, for the restore boxes' suggestions and the words check (as the app's).
         if (p == "/bip39.json") return reply(ex, 200, JSONArray(com.kilombino.pyblockwatch.crypto.Bip39Wordlist.WORDS), "application/json")
         if (!p.startsWith("/api/")) return static(ex, if (p == "/") "index.html" else p.removePrefix("/"))
@@ -346,6 +353,7 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
             "/api/forget" -> {
                 recheck(b)
                 require(coinjoin.live().isEmpty()) { "A coin of this wallet is in a coinjoin round: leave the pool first." }
+                require(!joinblaket.running) { JoinBlaket.BUSY }
                 coinjoin.clear()
                 // The Ark wallet goes too, but its folder is only set aside: it may still hold coins.
                 ark.forget()
@@ -356,9 +364,74 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
             }
             else -> when {
                 p.startsWith("/api/coinjoin") -> coinjoinRoute(ex, p, b, w)
+                p.startsWith("/api/joinblaket") -> joinblaketRoute(ex, p, b)
                 p.startsWith("/api/ark") -> arkRoute(ex, p, b)
                 else -> reply(ex, 404, err("not found"))
             }
+        }
+    }
+
+    // ------------------------------------------------------------------ JoinBlaket (PAY THROUGH JOINBLAKET)
+
+    /** Why this wallet can't pay through JoinBlaket at all (the app's rule: a spending wallet with bc1q addresses), or null. */
+    private fun joinblaketBlocker(): String? = when {
+        mode() != "hot" || walletFor(ScriptType.P2WPKH) == null -> JoinBlaket.NOT_SUPPORTED
+        else -> null
+    }
+
+    /**
+     * The coins a JoinBlaket payment may use: the ticked ones ([b] `coins`, coin control) or every
+     * confirmed coin of the bc1q account not held elsewhere; the round picks among them. Second:
+     * the ones of that same choice still unconfirmed (for "wait" instead of "no coin").
+     */
+    private fun jbCoins(w: NodeWallet, b: JSONObject): Pair<List<NodeWallet.Utxo>, List<NodeWallet.Utxo>> {
+        val ticked = strs(b.optJSONArray("coins")).toSet()
+        val locked = lockedAll()
+        val pool = w.utxos().filter { it.outpoint !in locked && (ticked.isEmpty() || it.outpoint in ticked) }
+        return pool.filter { it.confirmations > 0 } to pool.filter { it.confirmations <= 0 }
+    }
+
+    /** What a payment to [b] `to` of `amount` needs before the password is asked; throws with the reason. */
+    private fun jbValidate(b: JSONObject): Triple<NodeWallet, String, Long> {
+        joinblaketBlocker()?.let { error(it) }
+        require(joinblaket.torSocks != null) { JoinBlaket.NO_TOR }
+        check(!joinblaket.running) { JoinBlaket.BUSY }
+        require((b.optJSONArray("extra")?.length() ?: 0) == 0) { "One recipient only: JoinBlaket pays one address per CoinJoin." }
+        val to = resolve(b.optString("to")).trim()
+        require(joinblaket.p2wpkhScript(to) != null) { JoinBlaket.ONLY_BC1Q }
+        val amount = b.optLong("amount", 0)
+        require(amount > 0) { com.kilombino.pyblockwatch.joinblaket.TakerText.fill(com.kilombino.pyblockwatch.joinblaket.TakerText.INVALID_REQUEST, "the amount must be above zero") }
+        return Triple(walletFor(ScriptType.P2WPKH)!!, to, amount)
+    }
+
+    private fun joinblaketRoute(ex: HttpExchange, p: String, b: JSONObject) {
+        when (p) {
+            // The market block of SEND (makers with a bond, minimum, maximum, the cost for the typed amount), and the round going.
+            "/api/joinblaket" -> reply(ex, 200, joinblaket.marketJson(b.optLong("amount", 0), b.optDouble("rate", 1.0).takeIf { it > 0 } ?: 1.0)
+                .put("torUp", joinblaket.torSocks != null && joinblaket.torUp())
+                .put("blocker", joinblaketBlocker() ?: JSONObject.NULL)
+                .put("round", joinblaket.viewJson() ?: JSONObject.NULL))
+            "/api/joinblaket/round" -> reply(ex, 200, JSONObject().put("round", joinblaket.viewJson() ?: JSONObject.NULL))
+            // Before the password, as the app before the fingerprint: a coin the makers will take for the PoDLE.
+            "/api/joinblaket/precheck" -> {
+                val (w, _, amount) = jbValidate(b)
+                val (coins, unconfirmed) = jbCoins(w, b)
+                joinblaket.precheck(coins, unconfirmed, amount)?.let { error(it) }
+                reply(ex, 200, ok())
+            }
+            "/api/joinblaket/start" -> {
+                val (w, to, amount) = jbValidate(b)
+                val (coins, unconfirmed) = jbCoins(w, b)
+                joinblaket.precheck(coins, unconfirmed, amount)?.let { error(it) }
+                val sec = recheck(b)
+                val rate = b.optDouble("rate", 1.0).takeIf { it > 0 } ?: 1.0
+                joinblaket.start(sec, w, coins, to, amount, rate, rpc.height())
+                reply(ex, 200, JSONObject().put("round", joinblaket.viewJson() ?: JSONObject.NULL))
+            }
+            "/api/joinblaket/answer" -> { joinblaket.answer(b.optBoolean("yes")); reply(ex, 200, ok()) }
+            "/api/joinblaket/cancel" -> { joinblaket.cancel(); reply(ex, 200, ok()) }
+            "/api/joinblaket/dismiss" -> { joinblaket.dismiss(); reply(ex, 200, ok()) }
+            else -> reply(ex, 404, err("not found"))
         }
     }
 
@@ -520,15 +593,18 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
 
     /** Coins a normal send may use: not promised to a coinjoin round. */
     private fun spendable(w: NodeWallet): List<NodeWallet.Utxo> {
-        val locked = coinjoin.lockedOutpoints()
+        val locked = lockedAll()
         return w.utxos().filter { it.outpoint !in locked }
     }
 
     /** Every account's spendable coins (a hot wallet's bc1q and bc1p), biggest first. */
     private fun allSpendable(): List<NodeWallet.Utxo> = wallets().flatMap { spendable(it) }.sortedByDescending { it.value }
 
+    /** Coins a send or a pool must not touch: promised to a coinjoin round or to the JoinBlaket payment going. */
+    private fun lockedAll(): Set<String> = coinjoin.lockedOutpoints() + joinblaket.lockedOutpoints()
+
     private fun requireUnlocked(d: Spend.Draft) {
-        val locked = coinjoin.lockedOutpoints()
+        val locked = lockedAll()
         require(d.inputs.none { it.outpoint in locked }) { "A coin of this send is in a coinjoin round right now: leave the pool first, or pick other coins." }
     }
 
@@ -541,7 +617,7 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
      */
     private fun planSend(w: NodeWallet, chosen: Set<String>, to: String, amount: Long?, rate: Double,
                          extra: List<Pair<String, Long>> = emptyList()): Spend.Draft {
-        val locked = coinjoin.lockedOutpoints()
+        val locked = lockedAll()
         require(chosen.none { it in locked }) { "A chosen coin is in a coinjoin round right now." }
         val coins = allSpendable()
         // The payment that makes a perfect coin: its change goes to the pool's account, like the coin.
@@ -588,7 +664,7 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
     }
 
     private fun cjCoin(w: NodeWallet, outpoint: String): NodeWallet.Utxo {
-        require(outpoint !in coinjoin.lockedOutpoints()) { "That coin is already in a round." }
+        require(outpoint !in lockedAll()) { "That coin is already in a round." }
         val u = w.utxos().firstOrNull { it.outpoint == outpoint } ?: error("That coin is gone: reload the page.")
         require(u.confirmations > 0) { "Pick a confirmed coin." }
         return u
@@ -1036,7 +1112,7 @@ class Web(private val dir: File, private val rpc: Rpc, port: Int, arkRpc: ArkRpc
     })
 
     companion object {
-        const val VERSION = "0.10.0"
+        const val VERSION = "0.11.0"
         /** How far (per branch) a replaced transaction's coins are looked up in this wallet. */
         const val OURS = 400
 

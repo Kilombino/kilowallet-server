@@ -583,6 +583,7 @@ function btcTab(accent) {
   const parts = [scanStatus(w, accent)];
   if (w.error || w.importing || !S.w) return parts;
   parts.push(balanceCard(w, accent));
+  parts.push(jbLine(accent));
   if (S.sheet === 'send') parts.push(sendSheet(accent));
   else if (S.sheet === 'receive') parts.push(receiveSheet(accent));
   else parts.push(row('gap8', btn('RECEIVE', { kind: 'soft', grow: true, cls: 'tm', onclick: () => { S.sheet = 'receive'; S.recvIdx = null; render(); } }),
@@ -734,7 +735,7 @@ function sendForm(accent) {
   const cam = hasCamera() ? tbtn(R('📷'), accent, () => scanQr(v => { f.to = cleanDest(v); to.input.value = f.to; upd(); }), 'tm') : null;
   nameBox.append(contactName(f.to, accent) || '');
   const amount = field({ label: 'amount (sats)', mode: 'numeric', value: f.amount, style: { flex: '2 1 0' }, oninput: (v, el) => { el.value = v.replace(/\D/g, ''); f.amount = el.value; f.max = false; upd(); } });
-  const rate = field({ label: 'sat/vB', mode: 'decimal', value: f.rate, style: { flex: '1 1 0' }, oninput: (v, el) => { el.value = v.replace(',', '.').replace(/[^\d.]/g, ''); f.rate = el.value; } });
+  const rate = field({ label: 'sat/vB', mode: 'decimal', value: f.rate, style: { flex: '1 1 0' }, oninput: (v, el) => { el.value = v.replace(',', '.').replace(/[^\d.]/g, ''); f.rate = el.value; jbCheck(f, jbBox, accent); } });
   if (!f.rate) api('fee').then(r => { if (!f.rate) { f.rate = String(Math.max(1, Math.round((r.suggested || 2) * 10) / 10)); rate.input.value = f.rate; } }).catch(() => {});
   const maxBtn = f.extra.length ? null : tbtn('MAX', accent, async () => {
     if (!f.to.trim()) return toast('Type where to send.');
@@ -780,6 +781,8 @@ function sendForm(accent) {
   };
   drawCoins();
   const payBox = h('div', { class: 'col' });
+  // PAY THROUGH JOINBLAKET (jb.js): the market for this amount and the button.
+  const jbBox = h('div', { class: 'col', id: 'jbbox' });
   const review = btn('REVIEW', { full: true, cls: 'tm', onclick: () => api('send/prepare', {
     to: f.to.trim(), amount: Number(f.amount || 0), max: f.max, rate: Number(f.rate || 2), coins: f.coinControl ? [...f.coins] : [],
     extra: f.extra.map(x => ({ to: x.to.trim(), amount: Number(x.amount || 0) })) })
@@ -787,6 +790,7 @@ function sendForm(accent) {
   const upd = () => {
     review.disabled = !(f.to.trim() && Number(f.amount) > 0 && f.extra.every(x => x.to.trim() && Number(x.amount) > 0) && (!f.coinControl || f.coins.size));
     payCheck(f, payBox, accent);
+    jbCheck(f, jbBox, accent);
   };
   upd();
   return [failed ? [failed, spacer(6)] : null,
@@ -799,7 +803,7 @@ function sendForm(accent) {
     tbtn('＋ ADD RECIPIENT', accent, () => { f.extra.push({ to: '', amount: '' }); f.max = false; render(); }, 'bm', { style: { alignSelf: 'flex-start' } }),
     spacer(8),
     row('', t('Coin control', 'bm c-main grow'), sw(f.coinControl, v => { f.coinControl = v; drawCoins(); upd(); })),
-    coinBox, payBox, spacer(10), review];
+    coinBox, payBox, jbBox, spacer(10), review];
 }
 
 /**

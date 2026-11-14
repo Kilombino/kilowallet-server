@@ -343,6 +343,47 @@ const WEB_I18N = (() => {
       'Geminte Münzen lassen sich erst ausgeben, wenn sie gereift sind: sie sind nicht im Guthaben und SENDEN kann sie noch nicht verwenden. Die Daten sind eine Schätzung nach dem Tempo der letzten Blöcke.',
       'As moedas mineradas só se podem gastar quando amadurecem: não estão no saldo e ENVIAR ainda não as pode usar. As datas são uma estimativa pelo ritmo dos últimos blocos.',
       '挖到的币只有成熟后才能花费：它们不在余额中，发送暂时无法使用。日期是根据最近区块的速度估算的。'],
+    // PAY THROUGH JOINBLAKET: what only the server says (its Tor; "this server" where the app says "the phone").
+    'Tor is not available on this server, and the JoinBlaket directory is reached only through Tor.': [
+      'Tor no está disponible en este servidor, y al directorio de JoinBlaket solo se llega por Tor.',
+      'Tor no està disponible en aquest servidor, i al directori de JoinBlaket només s\'hi arriba per Tor.',
+      'Tor n\'est pas disponible sur ce serveur, et l\'annuaire de JoinBlaket n\'est joignable que par Tor.',
+      'Tor non è disponibile su questo server, e la directory di JoinBlaket si raggiunge solo tramite Tor.',
+      'Tor ist auf diesem Server nicht verfügbar, und das JoinBlaket-Verzeichnis ist nur über Tor erreichbar.',
+      'O Tor não está disponível neste servidor, e ao diretório do JoinBlaket só se chega por Tor.',
+      '此服务器上没有 Tor，而 JoinBlaket 目录只能通过 Tor 访问。'],
+    'Tor does not answer on this server right now, and the JoinBlaket directory is reached only through Tor.': [
+      'Tor no responde ahora mismo en este servidor, y al directorio de JoinBlaket solo se llega por Tor.',
+      'Tor no respon ara mateix en aquest servidor, i al directori de JoinBlaket només s\'hi arriba per Tor.',
+      'Tor ne répond pas sur ce serveur en ce moment, et l\'annuaire de JoinBlaket n\'est joignable que par Tor.',
+      'Tor non risponde su questo server in questo momento, e la directory di JoinBlaket si raggiunge solo tramite Tor.',
+      'Tor antwortet auf diesem Server gerade nicht, und das JoinBlaket-Verzeichnis ist nur über Tor erreichbar.',
+      'O Tor não responde neste servidor neste momento, e ao diretório do JoinBlaket só se chega por Tor.',
+      '此服务器上的 Tor 目前没有响应，而 JoinBlaket 目录只能通过 Tor 访问。'],
+    'On Umbrel, Tor comes with the system. On StartOS, install the Tor service.': [
+      'En Umbrel, Tor viene con el sistema. En StartOS, instala el servicio Tor.',
+      'A Umbrel, Tor ve amb el sistema. A StartOS, instal·la el servei Tor.',
+      'Sur Umbrel, Tor est fourni avec le système. Sur StartOS, installe le service Tor.',
+      'Su Umbrel, Tor è incluso nel sistema. Su StartOS, installa il servizio Tor.',
+      'Bei Umbrel ist Tor im System enthalten. Bei StartOS installiere den Dienst Tor.',
+      'No Umbrel, o Tor vem com o sistema. No StartOS, instala o serviço Tor.',
+      '在 Umbrel 上，Tor 随系统提供。在 StartOS 上，请安装 Tor 服务。'],
+    'Nothing about your coins has left this server yet. If a maker drops out, another may take its place within these fees.': [
+      'Todavía no ha salido de este servidor nada sobre tus monedas. Si un maker se retira, otro puede ocupar su lugar dentro de estas comisiones.',
+      'Encara no ha sortit d\'aquest servidor res sobre les teves monedes. Si un maker es retira, un altre pot ocupar-ne el lloc dins d\'aquestes comissions.',
+      'Rien sur tes pièces n\'a encore quitté ce serveur. Si un maker se retire, un autre peut prendre sa place dans ces frais.',
+      'Niente sulle tue monete ha ancora lasciato questo server. Se un maker si ritira, un altro può prenderne il posto entro queste commissioni.',
+      'Noch hat nichts über deine Münzen diesen Server verlassen. Springt ein Maker ab, kann ein anderer innerhalb dieser Gebühren seinen Platz einnehmen.',
+      'Ainda não saiu deste servidor nada sobre as tuas moedas. Se um maker desistir, outro pode ocupar o seu lugar dentro destas comissões.',
+      '关于你的币的任何信息都还没有离开此服务器。如果某个 maker 退出，另一个可以在这些费用之内接替它。'],
+    'It goes on on this server if you close this page.': [
+      'Sigue en este servidor aunque cierres esta página.',
+      'Continua en aquest servidor encara que tanquis aquesta pàgina.',
+      'Il continue sur ce serveur si tu fermes cette page.',
+      'Continua su questo server anche se chiudi questa pagina.',
+      'Es läuft auf diesem Server weiter, wenn du diese Seite schließt.',
+      'Continua neste servidor mesmo que feches esta página.',
+      '即使关闭此页面，它也会在此服务器上继续。'],
   };
   const langs = ['es', 'ca', 'fr', 'it', 'de', 'pt', 'zh'];
   const out = {};

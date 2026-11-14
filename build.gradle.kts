@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "com.kilombino.kilowallet"
-version = "0.10.5"
+version = "0.11.0"
 
 kotlin {
     jvmToolchain(17)
@@ -32,6 +32,12 @@ sourceSets {
             include("com/kilombino/pyblockwatch/coinjoin/Protocol.kt")
             include("com/kilombino/pyblockwatch/coinjoin/RelayClient.kt")
             include("com/kilombino/pyblockwatch/data/JoinMarket.kt")
+            // PAY THROUGH JOINBLAKET (1.6.0): the app's JoinMarket taker, as is, and the market feed of the send screen.
+            // Its Electrum lookup is not used here (the node by RPC is): ElectrumStub.kt stands in for the client.
+            include("com/kilombino/pyblockwatch/joinblaket/**")
+            include("com/kilombino/pyblockwatch/coinjoin/JoinBlaketMarket.kt")
+            include("com/kilombino/pyblockwatch/chain/ElectrumStub.kt")
+            include("com/kilombino/pyblockwatch/data/JamWatchStub.kt")
         }
     }
     test {
@@ -44,12 +50,23 @@ sourceSets {
             include("com/kilombino/pyblockwatch/coinjoin/TestChain.kt")
             include("com/kilombino/pyblockwatch/coinjoin/AsyncRoundsTest.kt")
             include("com/kilombino/pyblockwatch/coinjoin/AsyncRoundsE2ETest.kt")
+            // The taker's tests and vectors (not the two that need the app's Electrum client).
+            include("com/kilombino/pyblockwatch/joinblaket/**")
+            exclude("com/kilombino/pyblockwatch/joinblaket/ChainLookupTest.kt")
+            exclude("com/kilombino/pyblockwatch/joinblaket/JoinBlaketLiveTest.kt")
+            include("com/kilombino/pyblockwatch/coinjoin/JoinBlaketMarketTest.kt")
+        }
+        resources {
+            srcDir("kilowallet/app/src/test/resources")
+            include("joinblaket/**")
         }
     }
 }
 
 dependencies {
     implementation("org.json:json:20240303")
+    // The JoinBlaket taker runs on coroutines (the app uses the Android flavour of the same library).
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
     testImplementation(kotlin("test"))
     // The app's tests are JUnit 4; they run here on the JUnit Platform's vintage engine.
     testImplementation("junit:junit:4.13.2")

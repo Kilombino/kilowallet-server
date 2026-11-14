@@ -13,6 +13,11 @@ import java.io.File
  *   KILOWALLET_NETWORK coinjoin network name (default blake2b; tests use another, so their
  *                      pools never list on mainnet)
  *   KILOWALLET_RELAY   tests only, with a test KILOWALLET_NETWORK: a local relay (plain ws:// on the loopback)
+ *   KILOWALLET_TOR_SOCKS  host:port of a SOCKS5 proxy into Tor (Umbrel's or StartOS's): PAY THROUGH
+ *                      JOINBLAKET reaches its directory, an onion, through it. Unset or empty: no
+ *                      JoinBlaket (the page says Tor is not available)
+ *   KILOWALLET_JB_DIRECTORY / KILOWALLET_JB_DIRECTORY_ID  tests only, with a test KILOWALLET_NETWORK:
+ *                      a regtest JoinMarket lab's directory (host:port) and its nick-auth id
  *
  * On mainnet (KILOWALLET_NETWORK blake2b) the server first checks that the node follows the
  * BLAKE2b chain ([ChainCheck]) and refuses to work with one on the SHA-256 chain.
@@ -29,7 +34,15 @@ fun main() {
     val dir = File(env["KILOWALLET_DATA"] ?: "/data").apply { mkdirs() }
     val rpc = Rpc(env["BITCOIN_RPC_URL"] ?: "http://127.0.0.1:8332/", env["BITCOIN_RPC_USER"], env["BITCOIN_RPC_PASS"], env["BITCOIN_RPC_COOKIE"])
     val port = (env["KILOWALLET_PORT"] ?: "8080").toInt()
-    val web = Web(dir, rpc, port, Web.ArkRpc(env["BITCOIN_RPC_URL"], env["BITCOIN_RPC_USER"], env["BITCOIN_RPC_PASS"], env["BITCOIN_RPC_COOKIE"]))
+    // A SOCKS address like "10.21.21.11:9050"; Umbrel's compose leaves ":" when it has no Tor proxy to give.
+    val socks = env["KILOWALLET_TOR_SOCKS"]?.trim()?.takeIf { s -> s.substringBeforeLast(':', "").isNotBlank() && s.substringAfterLast(':').toIntOrNull() != null }
+    val jbDirectory = env["KILOWALLET_JB_DIRECTORY"]?.trim()?.ifEmpty { null }?.let { d ->
+        require(com.kilombino.pyblockwatch.coinjoin.Protocol.NETWORK != "blake2b") { "KILOWALLET_JB_DIRECTORY needs a test KILOWALLET_NETWORK" }
+        Triple(d.substringBeforeLast(':'), d.substringAfterLast(':').toInt(), env["KILOWALLET_JB_DIRECTORY_ID"] ?: d)
+    }
+    val joinblaket = JoinBlaket(dir, rpc, socks, jbDirectory)
+    System.err.println(if (socks != null) "JoinBlaket: Tor through $socks" else "JoinBlaket: no Tor proxy (KILOWALLET_TOR_SOCKS unset): PAY THROUGH JOINBLAKET is off")
+    val web = Web(dir, rpc, port, Web.ArkRpc(env["BITCOIN_RPC_URL"], env["BITCOIN_RPC_USER"], env["BITCOIN_RPC_PASS"], env["BITCOIN_RPC_COOKIE"]), joinblaket)
     web.coinjoin.onEvent = { e -> System.err.println("EVENT ${e.title}: ${e.text}") }
     web.start()
     System.err.println("Kilowallet listening on $port, node ${env["BITCOIN_RPC_URL"] ?: "http://127.0.0.1:8332/"}")
