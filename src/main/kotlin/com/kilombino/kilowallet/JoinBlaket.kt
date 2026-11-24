@@ -8,7 +8,9 @@ import com.kilombino.pyblockwatch.crypto.ScriptType
 import com.kilombino.pyblockwatch.crypto.TxParse
 import com.kilombino.pyblockwatch.joinblaket.ChainLookup
 import com.kilombino.pyblockwatch.joinblaket.CommitmentStore
+import com.kilombino.pyblockwatch.joinblaket.Directory
 import com.kilombino.pyblockwatch.joinblaket.DirectoryClient
+import com.kilombino.pyblockwatch.joinblaket.DirectoryPool
 import com.kilombino.pyblockwatch.joinblaket.DirectoryException
 import com.kilombino.pyblockwatch.joinblaket.FileCommitmentStore
 import com.kilombino.pyblockwatch.joinblaket.JbNetwork
@@ -259,7 +261,7 @@ class JoinBlaket(
     }
 
     private inner class Env(private val r: Round) : TakerEnv {
-        override fun directory(identity: NickIdentity): DirectoryClient = newDirectory(identity)
+        override fun directory(identity: NickIdentity): Directory = newDirectory(identity)
         override val chain: ChainLookup = nodeLookup()
         override fun broadcast(rawHex: String): String = rpc.call("sendrawtransaction", rawHex) as String
         override val commitments: CommitmentStore = this@JoinBlaket.commitments
@@ -275,16 +277,21 @@ class JoinBlaket(
         override fun log(line: String) { if (System.getenv("KILOWALLET_JB_LOG") != null) System.err.println("[taker] $line") }
     }
 
-    /** A client for the directory through Tor (the lab's directory, without Tor unless an onion, in a regtest test). */
-    private fun newDirectory(identity: NickIdentity): DirectoryClient {
+    /**
+     * JoinBlaket's directories through Tor, all at once with one nick, as the app does
+     * ([DirectoryPool]: the round goes on with those that answer); the lab's single directory
+     * (without Tor unless an onion) in a regtest test.
+     */
+    private fun newDirectory(identity: NickIdentity): Directory {
         val (h, p) = socksAddress() ?: throw DirectoryException(NO_TOR)
         // The name is resolved by the proxy: an onion has no other way in.
         val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress.createUnresolved(h, p))
         val d = directoryOverride
         return if (d != null) DirectoryClient(d.first, d.second, identity, network.wire, d.third, requireVerified = true,
             proxy = proxy.takeIf { DirectoryClient.isOnion(d.first) }, allowClearnet = true)
-        else DirectoryClient(JoinBlaketDirectory.HOST, JoinBlaketDirectory.PORT, identity, network.wire,
-            JoinBlaketDirectory.ID, requireVerified = true, proxy = proxy)
+        else DirectoryPool(JoinBlaketDirectory.ALL.map { e ->
+            DirectoryClient(e.host, e.port, identity, network.wire, e.id, requireVerified = true, proxy = proxy)
+        })
     }
 
     /** Chain lookups (makers' coins, fidelity bonds) through the node by RPC, as the Python taker does. */
@@ -311,8 +318,10 @@ class JoinBlaket(
         val valued = com.kilombino.pyblockwatch.joinblaket.BondValues.value(ob.offers, nodeLookup())
         val takes = valued.firstOrNull()?.offer?.let { maxOf(it.minsize, minOf(amount, it.maxsize)) } ?: amount
         val pick = com.kilombino.pyblockwatch.joinblaket.MakerSelection.choose(valued, takes, n = 9)
-        JSONObject().put("authenticated", c.authenticated).put("directoryFeatures", JSONArray(c.directoryFeatures.sorted()))
-            .put("peers", c.peers.size).put("offerMessages", ob.offerMessages).put("bondedOffers", ob.offers.size).put("dropped", ob.dropped)
+        val directories = (c as? DirectoryPool)?.connectedEndpoints ?: listOfNotNull((c as? DirectoryClient)?.let { "${it.host}:${it.port}" })
+        JSONObject().put("authenticated", c.authenticated).put("directories", JSONArray(directories))
+            .put("directoryFeatures", JSONArray(((c as? DirectoryClient)?.directoryFeatures ?: emptySet<String>()).sorted()))
+            .put("peers", (c as? DirectoryClient)?.peers?.size ?: JSONObject.NULL).put("offerMessages", ob.offerMessages).put("bondedOffers", ob.offers.size).put("dropped", ob.dropped)
             .put("valued", valued.count { it.value > 0 }).put("tries", tries + 1).put("seconds", (System.currentTimeMillis() - started) / 1000)
             .put("offers", JSONArray(valued.map { v ->
                 JSONObject().put("type", v.offer.type.wire).put("minsize", v.offer.minsize).put("maxsize", v.offer.maxsize)

@@ -46,7 +46,7 @@ phone, that reads the chain straight from your own node — no Electrum server.
   CoinJoin output of a JoinMarket CoinJoin on the BTC chain, with makers that hold a fidelity bond
   (the app's own taker code). SEND shows the market (makers, minimum, maximum, the cost for the
   amount); you confirm each maker's fee and the mining fee before anything about your coins leaves
-  the server. Needs Tor (the directory is an onion). Hot wallets with bc1q addresses only.
+  the server. Needs Tor (the directories are onions). Hot wallets with bc1q addresses only.
 
 Packaged for StartOS in [kilowallet-startos](https://github.com/Kilombino/kilowallet-startos).
 
@@ -72,14 +72,16 @@ no watch-only wallet is created or loaded, nothing is scanned or sent. Tests on 
 
 ### JoinBlaket and Tor
 
-The JoinBlaket directory is reached through a SOCKS5 proxy into Tor: `KILOWALLET_TOR_SOCKS=host:port`
+JoinBlaket's three directories are reached at once, as the app does since 1.6.4 (a round goes on
+with those that answer, and a maker seen on more than one counts once), through a SOCKS5 proxy into
+Tor: `KILOWALLET_TOR_SOCKS=host:port`
 (on Umbrel the system's Tor proxy, `$TOR_PROXY_IP:$TOR_PROXY_PORT`; on StartOS the Tor service's
 SOCKS port over the bridge). Unset, the page says Tor is not available and nothing else changes.
 Chain lookups (makers' coins, fidelity bonds) and the broadcast go through the node by RPC. Used
 PoDLE commitments are kept in `$KILOWALLET_DATA/joinblaket/commitments.json` (Python's format).
 `curl http://127.0.0.1:$KILOWALLET_PORT/internal/joinblaket/probe` (loopback only) checks the whole
-path read-only: the directory through Tor with nick authentication, its orderbook, every bond valued
-on the node. Tests may point `KILOWALLET_JB_DIRECTORY` (and `KILOWALLET_JB_DIRECTORY_ID`) at a regtest
+path read-only: the directories through Tor with nick authentication (the ones that answered are
+listed), the orderbook, every bond valued on the node. Tests may point `KILOWALLET_JB_DIRECTORY` (and `KILOWALLET_JB_DIRECTORY_ID`) at a regtest
 JoinMarket lab's directory, with a test `KILOWALLET_NETWORK` only.
 
 ### Ark
